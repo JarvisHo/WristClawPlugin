@@ -6,7 +6,6 @@ export type WristClawChannelConfig = {
   apiKey?: string;
   ownerUserId?: string;
   secretaryAgentId?: string;
-  dmPolicy?: string;
   allowFrom?: Array<string | number>;
 };
 
@@ -40,17 +39,4 @@ export type WristClawPair = {
     sender_id: string;
     created_at: string;
   };
-};
-
-/** WristClaw send message response */
-export type WristClawSendResult = {
-  message_id: string;
-  channel_id: string;
-  author_id: string;
-  payload: {
-    text?: string;
-    content_type?: string;
-    via?: string;
-  };
-  created_at: string;
 };

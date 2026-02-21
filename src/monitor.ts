@@ -131,19 +131,23 @@ function apiMessageToWSEvent(msg: APIMessage, pairChannel: string): WSEvent {
 // Process inbound message (follows zalouser pattern)
 // ---------------------------------------------------------------------------
 
-async function processMessage(
-  event: WSEvent,
-  channelId: string,
-  pairChannel: string,
-  ws: WebSocket | null,
-  botUserId: string,
-  account: ResolvedWristClawAccount,
-  config: OpenClawConfig,
-  core: PluginRuntimeType,
-  runtime: RuntimeEnv,
-  statusSink?: WristClawMonitorOptions["statusSink"],
-  rateLimitCheck?: (senderId: string) => boolean,
-): Promise<void> {
+type ProcessMessageCtx = {
+  event: WSEvent;
+  channelId: string;
+  pairChannel: string;
+  ws: WebSocket | null;
+  botUserId: string;
+  account: ResolvedWristClawAccount;
+  config: OpenClawConfig;
+  core: PluginRuntimeType;
+  runtime: RuntimeEnv;
+  statusSink?: WristClawMonitorOptions["statusSink"];
+  rateLimitCheck?: (senderId: string) => boolean;
+  dedupCheck?: (msgId: string) => boolean;
+};
+
+async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
+  const { event, channelId, pairChannel, ws, botUserId, account, config, core, runtime, statusSink, rateLimitCheck, dedupCheck } = ctx;
   const raw = event.payload;
   if (!raw) return;
 
@@ -160,6 +164,10 @@ async function processMessage(
   // === Echo prevention (double check: via field + sender_id) ===
   if (via === "openclaw") return;
   if (botUserId && senderId === botUserId) return;
+
+  // === Dedup check ===
+  const msgId = raw.message_id;
+  if (msgId && dedupCheck && !dedupCheck(msgId)) return;
 
   // === Allowlist check ===
   if (account.config.allowFrom?.length) {
@@ -411,6 +419,9 @@ export async function monitorWristClawProvider(
   // Bounded LRU-ish: evict oldest when exceeding cap
   const MESSAGE_AUTHOR_CAP = 500;
   const messageAuthorMap = new Map<string, string>();
+  // Dedup: prevent processing same message twice (WS + catch-up overlap)
+  const DEDUP_CAP = 1000;
+  const processedMessageIds = new Set<string>();
   // Concurrency limiter: max simultaneous AI dispatches
   const MAX_CONCURRENT = 3;
   let activeDispatches = 0;
@@ -443,6 +454,20 @@ export async function monitorWristClawProvider(
       else senderTimestamps.set(id, fresh);
     }
   }, 300_000);
+
+  function markProcessed(msgId: string): boolean {
+    if (processedMessageIds.has(msgId)) return false; // already processed
+    processedMessageIds.add(msgId);
+    if (processedMessageIds.size > DEDUP_CAP) {
+      // Evict oldest ~20%
+      const iter = processedMessageIds.values();
+      for (let i = 0; i < DEDUP_CAP * 0.2; i++) {
+        const v = iter.next().value;
+        if (v) processedMessageIds.delete(v);
+      }
+    }
+    return true; // first time
+  }
 
   let botUserId = "";
   let isFirstConnect = true;
@@ -552,7 +577,7 @@ export async function monitorWristClawProvider(
 
                   if (activeDispatches >= MAX_CONCURRENT) continue;
                   activeDispatches++;
-                  processMessage(synth, synthChId, pairChannel, ws, botUserId, account, config, core, runtime, statusSink, isRateLimited)
+                  processMessage({ event: synth, channelId: synthChId, pairChannel, ws, botUserId, account, config, core, runtime, statusSink, rateLimitCheck: isRateLimited, dedupCheck: markProcessed })
                     .catch((err) => runtime.error(`[wristclaw] catch-up error: ${String(err)}`))
                     .finally(() => { activeDispatches--; });
                   catchUpTotal++;
@@ -610,7 +635,7 @@ export async function monitorWristClawProvider(
           return;
         }
         activeDispatches++;
-        processMessage(msg, channelId, msg.channel ?? "", ws, botUserId, account, config, core, runtime, statusSink, isRateLimited)
+        processMessage({ event: msg, channelId, pairChannel: msg.channel ?? "", ws, botUserId, account, config, core, runtime, statusSink, rateLimitCheck: isRateLimited, dedupCheck: markProcessed })
           .catch((err) => runtime.error(`[wristclaw] process error: ${String(err)}`))
           .finally(() => { activeDispatches--; });
         return;
@@ -653,7 +678,7 @@ export async function monitorWristClawProvider(
           return;
         }
         activeDispatches++;
-        processMessage(syntheticEvent, channelId, msg.channel ?? "", ws, botUserId, account, config, core, runtime, statusSink, isRateLimited)
+        processMessage({ event: syntheticEvent, channelId, pairChannel: msg.channel ?? "", ws, botUserId, account, config, core, runtime, statusSink, rateLimitCheck: isRateLimited, dedupCheck: markProcessed })
           .catch((err) => runtime.error(`[wristclaw] voice:transcribed process error: ${String(err)}`))
           .finally(() => { activeDispatches--; });
         return;
