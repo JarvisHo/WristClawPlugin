@@ -1,5 +1,11 @@
 import { randomUUID } from "node:crypto";
+import type { BaseResult } from "./types.js";
 import { fetchWithRetry } from "./fetch-utils.js";
+
+/** Build Authorization header for WristClaw API */
+export function authHeaders(apiKey: string): Record<string, string> {
+  return { Authorization: `Bearer ${apiKey}` };
+}
 
 export type InteractiveButton = {
   id: string;
@@ -23,10 +29,17 @@ export type SendMessageOptions = {
   replyToMessageId?: string;
 };
 
-export type SendMessageResult = {
-  ok: boolean;
+export type SendMessageResult = BaseResult & {
   messageId?: string;
-  error?: string;
+};
+
+export type UploadMediaResult = BaseResult & {
+  mediaKey?: string;
+};
+
+export type ProbeResult = BaseResult & {
+  status?: string;
+  version?: string;
 };
 
 /**
@@ -74,7 +87,7 @@ export async function sendMessageWristClaw(
     const res = await fetchWithRetry(url, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${opts.apiKey}`,
+        ...authHeaders(opts.apiKey),
         "Content-Type": "application/json",
       },
       body: JSON.stringify(body),
@@ -159,7 +172,7 @@ export async function uploadMediaWristClaw(
   contentType: string,
   mediaType: "image" | "voice",
   opts: { serverUrl: string; apiKey: string },
-): Promise<{ ok: boolean; mediaKey?: string; error?: string }> {
+): Promise<UploadMediaResult> {
   const url = `${opts.serverUrl}/v1/upload`;
 
   // Sanitize filename to prevent header injection
@@ -197,7 +210,7 @@ export async function uploadMediaWristClaw(
     const res = await fetchWithRetry(url, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${opts.apiKey}`,
+        ...authHeaders(opts.apiKey),
         "Content-Type": `multipart/form-data; boundary=${boundary}`,
       },
       body,
@@ -223,7 +236,7 @@ export async function uploadMediaWristClaw(
 export async function probeWristClaw(
   serverUrl: string,
   timeoutMs = 5000,
-): Promise<{ ok: boolean; status?: string; version?: string; error?: string }> {
+): Promise<ProbeResult> {
   try {
     const res = await fetchWithRetry(`${serverUrl}/health`, {
       timeoutMs,
@@ -237,6 +250,6 @@ export async function probeWristClaw(
       version: data.version,
     };
   } catch (err) {
-    return { ok: false, error: String(err) };
+    return { ok: false, error: String(err).slice(0, 200) };
   }
 }

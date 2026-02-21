@@ -1,3 +1,15 @@
+// ---------------------------------------------------------------------------
+// Type placement rules:
+// - Shared across files → types.ts
+// - File-private (WS events, channelData shapes, etc.) → keep in source file
+// ---------------------------------------------------------------------------
+
+/** Base result type for all WristClaw API operations */
+export type BaseResult = {
+  ok: boolean;
+  error?: string;
+};
+
 /** WristClaw channel config shape (channels.wristclaw in openclaw.json) */
 export type WristClawChannelConfig = {
   enabled?: boolean;

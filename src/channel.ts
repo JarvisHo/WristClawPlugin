@@ -2,6 +2,7 @@ import type { ChannelPlugin, ChannelAccountSnapshot, OpenClawConfig } from "open
 import type { ResolvedWristClawAccount } from "./types.js";
 import { resolveWristClawAccount, listWristClawAccountIds } from "./config.js";
 import { sendMessageWristClaw, uploadMediaWristClaw, probeWristClaw, parseInteractiveButtons, type InteractivePayload } from "./send.js";
+import { fetchWithRetry } from "./fetch-utils.js";
 import { getWristClawRuntime } from "./runtime.js";
 
 /** channelData.wristclaw shape from OpenClaw core */
@@ -173,7 +174,7 @@ export const wristclawPlugin: ChannelPlugin<ResolvedWristClawAccount> = {
       // Try to download and upload image
       if (mediaUrl) {
         try {
-          const res = await fetch(mediaUrl, { signal: AbortSignal.timeout(15_000) });
+          const res = await fetchWithRetry(mediaUrl, { timeoutMs: 15_000, retries: 1 });
           if (res.ok) {
             const buffer = new Uint8Array(await res.arrayBuffer());
             const ct = res.headers.get("content-type") || "image/png";
@@ -237,7 +238,7 @@ export const wristclawPlugin: ChannelPlugin<ResolvedWristClawAccount> = {
   gateway: {
     startAccount: async (ctx) => {
       const account = ctx.account;
-      ctx.log?.info(`[${account.accountId}] starting WristClaw provider`);
+      ctx.log?.info(`[wristclaw] starting provider (account: ${account.accountId})`);
       const { monitorWristClawProvider } = await import("./monitor.js");
       return monitorWristClawProvider({
         account,

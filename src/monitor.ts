@@ -3,7 +3,7 @@ import type { OpenClawConfig, RuntimeEnv } from "openclaw/plugin-sdk";
 import { createReplyPrefixOptions } from "openclaw/plugin-sdk";
 import type { ResolvedWristClawAccount, WristClawPair } from "./types.js";
 import { getWristClawRuntime } from "./runtime.js";
-import { sendMessageWristClaw } from "./send.js";
+import { sendMessageWristClaw, authHeaders } from "./send.js";
 import { fetchWithRetry } from "./fetch-utils.js";
 
 type PluginRuntimeType = ReturnType<typeof getWristClawRuntime>;
@@ -73,7 +73,32 @@ type WSEvent =
   | { type: "pair:created"; channel?: string; payload?: WSPairCreatedPayload }
   | { type: "error"; payload?: { message?: string } };
 
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/** Max text length per outbound message chunk */
 const TEXT_LIMIT = 4000;
+/** Max cached message→author mappings (for voice:transcribed author resolution) */
+const MESSAGE_AUTHOR_CAP = 500;
+/** Max tracked processed message IDs (dedup WS + catch-up overlap) */
+const DEDUP_CAP = 1000;
+/** Max simultaneous AI dispatch coroutines */
+const MAX_CONCURRENT = 3;
+/** Per-sender rate limit: max messages within window */
+const RATE_LIMIT_MAX = 10;
+/** Per-sender rate limit: sliding window duration (ms) */
+const RATE_LIMIT_WINDOW_MS = 60_000;
+/** Rate limit map cleanup interval (ms) */
+const RATE_LIMIT_CLEANUP_MS = 300_000;
+/** WS keepalive ping interval (ms) */
+const PING_INTERVAL_MS = 30_000;
+/** WS pong response timeout — force reconnect if exceeded (ms) */
+const PONG_TIMEOUT_MS = 10_000;
+/** Max reconnect backoff (ms) */
+const MAX_BACKOFF_MS = 60_000;
+/** Typing indicator heartbeat interval (ms) */
+const TYPING_HEARTBEAT_MS = 3_500;
 
 // ---------------------------------------------------------------------------
 // Pair list fetch
@@ -81,7 +106,7 @@ const TEXT_LIMIT = 4000;
 
 async function fetchBotUserId(account: ResolvedWristClawAccount): Promise<string> {
   const res = await fetchWithRetry(`${account.serverUrl}/v1/me`, {
-    headers: { Authorization: `Bearer ${account.apiKey}` },
+    headers: authHeaders(account.apiKey),
     timeoutMs: 10_000,
     retries: 2,
   });
@@ -92,7 +117,7 @@ async function fetchBotUserId(account: ResolvedWristClawAccount): Promise<string
 
 async function fetchPairList(account: ResolvedWristClawAccount): Promise<WristClawPair[]> {
   const res = await fetchWithRetry(`${account.serverUrl}/v1/pair/list`, {
-    headers: { Authorization: `Bearer ${account.apiKey}` },
+    headers: authHeaders(account.apiKey),
     timeoutMs: 10_000,
     retries: 2,
   });
@@ -124,7 +149,7 @@ async function fetchMissedMessages(
   if (!/^[\w-]+$/.test(afterMessageId)) return [];
   const url = `${account.serverUrl}/v1/channels/${channelId}/messages?after=${afterMessageId}&limit=50`;
   const res = await fetchWithRetry(url, {
-    headers: { Authorization: `Bearer ${account.apiKey}` },
+    headers: authHeaders(account.apiKey),
     timeoutMs: 10_000,
     retries: 2,
   });
@@ -336,7 +361,7 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
   // Start with "thinking" status while AI processes, heartbeat every 3.5s
   sendTypingStatus("thinking");
   let currentTypingStatus: "thinking" | "typing" = "thinking";
-  const typingInterval = setInterval(() => sendTypingStatus(currentTypingStatus), 3500);
+  const typingInterval = setInterval(() => sendTypingStatus(currentTypingStatus), TYPING_HEARTBEAT_MS);
 
   try {
     await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
@@ -424,6 +449,11 @@ function extractChannelId(
 // WebSocket monitor with reconnect
 // ---------------------------------------------------------------------------
 
+/**
+ * Start monitoring all WristClaw pairs via WebSocket.
+ * Handles auth, pair subscription, inbound dispatch, catch-up on reconnect,
+ * typing indicators, rate limiting, and graceful shutdown.
+ */
 export async function monitorWristClawProvider(
   options: WristClawMonitorOptions,
 ): Promise<{ stop: () => void }> {
@@ -443,18 +473,9 @@ export async function monitorWristClawProvider(
   // channel_id → last seen message_id (for reconnect catch-up)
   const lastSeenMessageId = new Map<string, string>();
   // message_id → author_id cache (for voice:transcribed which lacks author_id)
-  // Bounded LRU-ish: evict oldest when exceeding cap
-  const MESSAGE_AUTHOR_CAP = 500;
   const messageAuthorMap = new Map<string, string>();
-  // Dedup: prevent processing same message twice (WS + catch-up overlap)
-  const DEDUP_CAP = 1000;
   const processedMessageIds = new Set<string>();
-  // Concurrency limiter: max simultaneous AI dispatches
-  const MAX_CONCURRENT = 3;
   let activeDispatches = 0;
-  // Per-sender rate limiter: max 10 messages per 60s window
-  const RATE_LIMIT_WINDOW_MS = 60_000;
-  const RATE_LIMIT_MAX = 10;
   const senderTimestamps = new Map<string, number[]>();
 
   function isRateLimited(senderId: string): boolean {
@@ -480,7 +501,7 @@ export async function monitorWristClawProvider(
       if (fresh.length === 0) senderTimestamps.delete(id);
       else senderTimestamps.set(id, fresh);
     }
-  }, 300_000);
+  }, RATE_LIMIT_CLEANUP_MS);
 
   function markProcessed(msgId: string): boolean {
     if (processedMessageIds.has(msgId)) return false; // already processed
@@ -559,8 +580,8 @@ export async function monitorWristClawProvider(
           pongTimeout = setTimeout(() => {
             runtime.error("[wristclaw] pong timeout (10s), forcing reconnect");
             try { ws?.close(); } catch { /* ignore */ }
-          }, 10_000);
-        }, 30_000);
+          }, PONG_TIMEOUT_MS);
+        }, PING_INTERVAL_MS);
 
         runtime.log("[wristclaw] authenticated, fetching pairs...");
 
@@ -745,7 +766,7 @@ export async function monitorWristClawProvider(
       }
       runtime.log(`[wristclaw] disconnected (${code}), reconnecting in ${backoff}ms`);
       reconnectTimer = setTimeout(connect, backoff);
-      backoff = Math.min(backoff * 2, 60000);
+      backoff = Math.min(backoff * 2, MAX_BACKOFF_MS);
     });
 
     ws.on("error", (err) => {

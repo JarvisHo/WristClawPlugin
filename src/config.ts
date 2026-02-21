@@ -3,6 +3,7 @@ import type { ResolvedWristClawAccount, WristClawChannelConfig } from "./types.j
 
 const DEFAULT_SERVER_URL = "http://localhost:8090";
 
+/** Resolve WristClaw account config from OpenClaw config, applying defaults. */
 export function resolveWristClawAccount(params: {
   cfg: OpenClawConfig;
   accountId?: string | null;
@@ -20,6 +21,7 @@ export function resolveWristClawAccount(params: {
   };
 }
 
+/** List configured WristClaw account IDs (currently always ["default"] or []). */
 export function listWristClawAccountIds(cfg: OpenClawConfig): string[] {
   const wc = (cfg.channels as Record<string, unknown> | undefined)?.wristclaw;
   return wc ? ["default"] : [];
