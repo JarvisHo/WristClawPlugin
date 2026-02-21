@@ -16,35 +16,62 @@ export type WristClawMonitorOptions = {
   statusSink?: (patch: { lastInboundAt?: number; lastOutboundAt?: number }) => void;
 };
 
-// WS event payload from WristClawServer
-// Server sends: { type, channel, payload: { author_id, channel_id, message_id, created_at, payload: { content_type, text, media_url, via, ... } } }
-type WSEvent = {
-  type: string;
-  channel?: string;
-  payload?: {
-    // Top-level fields in WS broadcast payload
-    pair_id?: string;
-    author_id?: string;
-    channel_id?: string;
-    message_id?: string;
-    created_at?: string;
-    media_url?: string;
-    // Nested payload (message content)
-    payload?: {
-      content_type?: string;
-      text?: string;
-      media_url?: string;
-      duration_sec?: number;
-      via?: string;
-    };
-    // Flattened aliases for API long-poll format
-    sender_id?: string;
-    sender_name?: string;
-    content_type?: string;
-    text?: string;
-    via?: string;
-  };
+// ---------------------------------------------------------------------------
+// WS event types (discriminated union)
+// ---------------------------------------------------------------------------
+
+/** Nested message content inside WS broadcast */
+type WSMessageContent = {
+  content_type?: string;
+  text?: string;
+  media_url?: string;
+  duration_sec?: number;
+  via?: string;
 };
+
+/** Reply context included in message:new broadcast */
+type WSReplyTo = {
+  message_id?: string;
+  author_id?: string;
+  text_preview?: string;
+  quote_text?: string;
+};
+
+/** message:new payload from OutboxProcessor */
+type WSMessagePayload = {
+  pair_id?: string;
+  author_id?: string;
+  channel_id?: string;
+  message_id?: string;
+  created_at?: string;
+  media_url?: string;
+  reply_to?: WSReplyTo;
+  payload?: WSMessageContent;
+};
+
+/** voice:transcribed payload */
+type WSVoiceTranscribedPayload = {
+  pair_id?: string;
+  message_id?: string;
+  channel_id?: string;
+  author_id?: string;
+  text?: string;
+  language?: string;
+};
+
+/** pair:created payload */
+type WSPairCreatedPayload = {
+  pair_id?: string;
+};
+
+type WSEvent =
+  | { type: "authenticated" }
+  | { type: "pong" }
+  | { type: "subscribed"; channel?: string }
+  | { type: "message:new"; channel?: string; payload?: WSMessagePayload }
+  | { type: "voice:transcribed"; channel?: string; payload?: WSVoiceTranscribedPayload }
+  | { type: "pair:created"; channel?: string; payload?: WSPairCreatedPayload }
+  | { type: "error"; payload?: { message?: string } };
 
 const TEXT_LIMIT = 4000;
 
@@ -106,9 +133,9 @@ async function fetchMissedMessages(
   return data.messages ?? [];
 }
 
-function apiMessageToWSEvent(msg: APIMessage, pairChannel: string): WSEvent {
+function apiMessageToWSEvent(msg: APIMessage, pairChannel: string): WSEvent & { type: "message:new" } {
   return {
-    type: "message:new",
+    type: "message:new" as const,
     channel: pairChannel,
     payload: {
       message_id: msg.message_id,
@@ -132,7 +159,7 @@ function apiMessageToWSEvent(msg: APIMessage, pairChannel: string): WSEvent {
 // ---------------------------------------------------------------------------
 
 type ProcessMessageCtx = {
-  event: WSEvent;
+  event: WSEvent & { type: "message:new" };
   channelId: string;
   pairChannel: string;
   ws: WebSocket | null;
@@ -151,15 +178,14 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
   const raw = event.payload;
   if (!raw) return;
 
-  // Normalize: server WS sends nested { payload: { content_type, text, via } }
-  // API long-poll sends flat { content_type, text, sender_id, via }
   const nested = raw.payload;
-  const via = nested?.via ?? raw.via;
-  const contentType = nested?.content_type ?? raw.content_type ?? "text";
-  const text = nested?.text ?? raw.text;
+  const via = nested?.via;
+  const contentType = nested?.content_type ?? "text";
+  const text = nested?.text;
   const mediaUrl = nested?.media_url ?? raw.media_url;
-  const senderId = raw.author_id ?? raw.sender_id ?? "";
-  const senderName = raw.sender_name ?? "";
+  const senderId = raw.author_id ?? "";
+  // WS broadcast doesn't include sender_name; left empty (only used for envelope label)
+  const senderName = "";
 
   // === Echo prevention (double check: via field + sender_id) ===
   if (via === "openclaw") return;
@@ -198,9 +224,7 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
   if (!rawBody) return;
 
   // === Parse reply context for AI ===
-  const replyTo = (event.payload as Record<string, unknown>)?.reply_to as
-    | { message_id?: string; author_id?: string; text_preview?: string }
-    | undefined;
+  const replyTo = raw.reply_to;
   const replyQuoteText = replyTo?.text_preview || "";
   if (replyQuoteText) {
     // Truncate + sanitize: strip control chars, mark as user-quoted content
@@ -232,6 +256,7 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
 
   // === Build inbound context ===
   const storePath = core.channel.session.resolveStorePath(
+    // SDK doesn't expose session.store type — cast required
     (config.session as { store?: string } | undefined)?.store,
     { agentId: route.agentId },
   );
@@ -328,6 +353,7 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
           clearInterval(typingInterval);
 
           const text = core.channel.text.convertMarkdownTables(
+            // SDK deliver callback payload type is opaque — cast required
             (replyPayload as { text?: string }).text ?? "",
             "code",
           );
@@ -371,15 +397,16 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
 // ---------------------------------------------------------------------------
 
 function extractChannelId(
-  event: WSEvent,
+  event: WSEvent & { type: "message:new" | "voice:transcribed" },
   pairToChannel: Map<string, string>,
 ): string | null {
+  const payload = event.payload;
   // Server WS broadcast includes channel_id directly
-  if (event.payload?.channel_id) {
-    return event.payload.channel_id;
+  if (payload?.channel_id) {
+    return payload.channel_id;
   }
   // Try pair_id → channel_id mapping
-  const pairId = event.payload?.pair_id;
+  const pairId = payload?.pair_id;
   if (pairId && pairToChannel.has(pairId)) {
     return pairToChannel.get(pairId)!;
   }
@@ -643,8 +670,8 @@ export async function monitorWristClawProvider(
 
       // Voice transcribed → dispatch transcription text to AI
       if (msg.type === "voice:transcribed") {
-        const vPayload = msg.payload as Record<string, unknown> | undefined;
-        const vText = String(vPayload?.text ?? "").trim();
+        const vPayload = msg.payload;
+        const vText = (vPayload?.text ?? "").trim();
         if (!vText) return;
 
         // Resolve channel from pair channel
@@ -652,16 +679,16 @@ export async function monitorWristClawProvider(
         if (!channelId) return;
 
         // author_id: server includes it in voice:transcribed payload; fallback to cache
-        const vMsgId = String(vPayload?.message_id ?? "");
-        const cachedAuthorId = (vPayload?.author_id as string | undefined)
+        const vMsgId = vPayload?.message_id ?? "";
+        const cachedAuthorId = vPayload?.author_id
           ?? (vMsgId ? messageAuthorMap.get(vMsgId) : undefined);
 
-        // Build a synthetic message:new-like event for processMessage
-        const syntheticEvent: WSEvent = {
-          type: "message:new",
+        // Build a synthetic message:new event for processMessage
+        const syntheticEvent: WSEvent & { type: "message:new" } = {
+          type: "message:new" as const,
           channel: msg.channel,
           payload: {
-            pair_id: vPayload?.pair_id as string | undefined,
+            pair_id: vPayload?.pair_id,
             message_id: vMsgId || undefined,
             channel_id: channelId,
             author_id: cachedAuthorId,

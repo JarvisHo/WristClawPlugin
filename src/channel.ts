@@ -4,6 +4,27 @@ import { resolveWristClawAccount, listWristClawAccountIds } from "./config.js";
 import { sendMessageWristClaw, uploadMediaWristClaw, probeWristClaw, parseInteractiveButtons, type InteractivePayload } from "./send.js";
 import { getWristClawRuntime } from "./runtime.js";
 
+/** channelData.wristclaw shape from OpenClaw core */
+type WristClawChannelData = {
+  interactive?: InteractivePayload;
+  replyToMessageId?: string;
+};
+
+/** channelData.telegram shape (inline buttons) */
+type TelegramChannelData = {
+  buttons?: { text: string; callback_data?: string }[][];
+};
+
+/** channelData.line shape (parsed from [[buttons:...]] template by OpenClaw core) */
+type LineChannelData = {
+  templateMessage?: {
+    type: string;
+    title?: string;
+    text?: string;
+    actions?: { label: string; data?: string; type?: string }[];
+  };
+};
+
 export const wristclawPlugin: ChannelPlugin<ResolvedWristClawAccount> = {
   id: "wristclaw",
 
@@ -86,20 +107,10 @@ export const wristclawPlugin: ChannelPlugin<ResolvedWristClawAccount> = {
         return { ok: false, error: "WristClaw API key not configured" };
       }
 
-      // Extract interactive payload from channelData
-      const wcData = payload?.channelData?.wristclaw as
-        | { interactive?: InteractivePayload; replyToMessageId?: string }
-        | undefined;
-
-      // Also support Telegram-style buttons → convert to WristClaw interactive
-      const tgData = payload?.channelData?.telegram as
-        | { buttons?: { text: string; callback_data?: string }[][] }
-        | undefined;
-
-      // Also support LINE-style templateMessage (parsed from [[buttons:...]] by OpenClaw core)
-      const lineData = payload?.channelData?.line as
-        | { templateMessage?: { type: string; title?: string; text?: string; actions?: { label: string; data?: string; type?: string }[] } }
-        | undefined;
+      // Extract interactive payload from channelData (SDK types are opaque — cast required)
+      const wcData = payload?.channelData?.wristclaw as WristClawChannelData | undefined;
+      const tgData = payload?.channelData?.telegram as TelegramChannelData | undefined;
+      const lineData = payload?.channelData?.line as LineChannelData | undefined;
 
       let interactive: InteractivePayload | undefined = wcData?.interactive;
 

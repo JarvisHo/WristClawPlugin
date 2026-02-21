@@ -48,25 +48,27 @@ export async function sendMessageWristClaw(
   validateChannelId(channelId);
   const url = `${opts.serverUrl}/v1/channels/${channelId}/messages`;
 
-  const body: Record<string, unknown> = {
+  type SendMessageBody = {
+    client_request_id: string;
+    content_type: string;
+    text: string;
+    via: string;
+    media_key?: string;
+    duration_sec?: number;
+    interactive?: InteractivePayload;
+    reply_to_message_id?: string;
+  };
+
+  const body: SendMessageBody = {
     client_request_id: `openclaw-${randomUUID()}`,
     content_type: opts.contentType ?? "text",
     text,
     via: opts.via ?? "openclaw",
+    ...(opts.mediaKey && { media_key: opts.mediaKey }),
+    ...(opts.durationSec != null && { duration_sec: opts.durationSec }),
+    ...(opts.interactive && { interactive: opts.interactive }),
+    ...(opts.replyToMessageId != null && { reply_to_message_id: opts.replyToMessageId }),
   };
-
-  if (opts.mediaKey) {
-    body.media_key = opts.mediaKey;
-  }
-  if (opts.durationSec != null) {
-    body.duration_sec = opts.durationSec;
-  }
-  if (opts.interactive) {
-    body.interactive = opts.interactive;
-  }
-  if (opts.replyToMessageId != null) {
-    body.reply_to_message_id = opts.replyToMessageId;
-  }
 
   try {
     const res = await fetchWithRetry(url, {
