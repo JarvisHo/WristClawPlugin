@@ -1,0 +1,12 @@
+{
+  "id": "wristclaw",
+  "channels": ["wristclaw"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "serverUrl": { "type": "string" },
+      "apiKey": { "type": "string" }
+    }
+  }
+}

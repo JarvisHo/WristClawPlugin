@@ -1,0 +1,248 @@
+import type { ChannelPlugin, ChannelAccountSnapshot, OpenClawConfig } from "openclaw/plugin-sdk";
+import type { ResolvedWristClawAccount } from "./types.js";
+import { resolveWristClawAccount, listWristClawAccountIds } from "./config.js";
+import { sendMessageWristClaw, uploadMediaWristClaw, probeWristClaw, parseInteractiveButtons, type InteractivePayload } from "./send.js";
+import { getWristClawRuntime } from "./runtime.js";
+
+export const wristclawPlugin: ChannelPlugin<ResolvedWristClawAccount> = {
+  id: "wristclaw",
+
+  meta: {
+    id: "wristclaw",
+    label: "WristClaw",
+    selectionLabel: "WristClaw (API)",
+    docsPath: "/channels/wristclaw",
+    blurb: "WristClaw messaging via WebSocket + REST API.",
+    aliases: ["wc", "speaka"],
+  },
+
+  capabilities: {
+    chatTypes: ["direct"],
+    media: true,
+    inlineButtons: "all",
+  },
+
+  reload: { configPrefixes: ["channels.wristclaw"] },
+
+  config: {
+    listAccountIds: (cfg) => listWristClawAccountIds(cfg),
+
+    resolveAccount: (cfg, accountId) => resolveWristClawAccount({ cfg, accountId }),
+
+    isConfigured: (account) => Boolean(account.apiKey?.trim()),
+
+    isEnabled: (account) => account.enabled,
+
+    describeAccount: (account) => ({
+      accountId: account.accountId,
+      enabled: account.enabled,
+      configured: Boolean(account.apiKey?.trim()),
+      baseUrl: account.serverUrl,
+    }),
+  },
+
+  outbound: {
+    deliveryMode: "direct",
+    textChunkLimit: 4000,
+
+    chunker: (text, limit) =>
+      getWristClawRuntime().channel.text.chunkMarkdownText(text, limit),
+    chunkerMode: "markdown",
+
+    sendText: async ({ to, text, cfg, replyToId }) => {
+      const account = resolveWristClawAccount({ cfg });
+      if (!account.apiKey) {
+        return { ok: false, error: "WristClaw API key not configured" };
+      }
+
+      const replyToMessageId = replyToId ?? undefined;
+
+      // Parse [[buttons: title | text | btn1:data1, btn2:data2]] template
+      const parsed = parseInteractiveButtons(text);
+      if (parsed) {
+        const result = await sendMessageWristClaw(to, parsed.text, {
+          serverUrl: account.serverUrl,
+          apiKey: account.apiKey,
+          contentType: "interactive",
+          interactive: parsed.interactive,
+          replyToMessageId,
+        });
+        return { channel: "wristclaw", ...result };
+      }
+
+      const result = await sendMessageWristClaw(to, text, {
+        serverUrl: account.serverUrl,
+        apiKey: account.apiKey,
+        replyToMessageId,
+      });
+
+      return { channel: "wristclaw", ...result };
+    },
+
+    sendPayload: async ({ to, text: rawText, payload, cfg }) => {
+      let text = rawText;
+      const account = resolveWristClawAccount({ cfg });
+      if (!account.apiKey) {
+        return { ok: false, error: "WristClaw API key not configured" };
+      }
+
+      // Extract interactive payload from channelData
+      const wcData = payload?.channelData?.wristclaw as
+        | { interactive?: InteractivePayload; replyToMessageId?: string }
+        | undefined;
+
+      // Also support Telegram-style buttons → convert to WristClaw interactive
+      const tgData = payload?.channelData?.telegram as
+        | { buttons?: { text: string; callback_data?: string }[][] }
+        | undefined;
+
+      // Also support LINE-style templateMessage (parsed from [[buttons:...]] by OpenClaw core)
+      const lineData = payload?.channelData?.line as
+        | { templateMessage?: { type: string; title?: string; text?: string; actions?: { label: string; data?: string; type?: string }[] } }
+        | undefined;
+
+      let interactive: InteractivePayload | undefined = wcData?.interactive;
+
+      if (!interactive && lineData?.templateMessage?.type === "buttons") {
+        const actions = lineData.templateMessage.actions || [];
+        const buttons = actions.map((a, i) => ({
+          id: a.data || a.label || `btn_${i}`,
+          label: a.label,
+        }));
+        if (buttons.length > 0) {
+          interactive = { type: "buttons", buttons };
+          // Use LINE template text if main text is empty
+          if (!text && lineData.templateMessage.text) {
+            text = lineData.templateMessage.text;
+          }
+        }
+      }
+
+      if (!interactive && tgData?.buttons) {
+        // Convert Telegram inline keyboard to WristClaw buttons
+        const buttons = tgData.buttons
+          .flat()
+          .map((btn, i) => ({
+            id: btn.callback_data || `btn_${i}`,
+            label: btn.text,
+          }));
+        if (buttons.length > 0) {
+          interactive = { type: "buttons", buttons };
+        }
+      }
+
+      const replyToMessageId = wcData?.replyToMessageId;
+
+      if (interactive) {
+        const result = await sendMessageWristClaw(to, text || "", {
+          serverUrl: account.serverUrl,
+          apiKey: account.apiKey,
+          contentType: "interactive",
+          interactive,
+          replyToMessageId,
+        });
+        return { channel: "wristclaw", ...result };
+      }
+
+      // Fallback to text
+      const result = await sendMessageWristClaw(to, text || "", {
+        serverUrl: account.serverUrl,
+        apiKey: account.apiKey,
+        replyToMessageId,
+      });
+      return { channel: "wristclaw", ...result };
+    },
+
+    sendMedia: async ({ to, text, mediaUrl, cfg }) => {
+      const account = resolveWristClawAccount({ cfg });
+      if (!account.apiKey) {
+        return { ok: false, error: "WristClaw API key not configured" };
+      }
+
+      // Try to download and upload image
+      if (mediaUrl) {
+        try {
+          const res = await fetch(mediaUrl, { signal: AbortSignal.timeout(15_000) });
+          if (res.ok) {
+            const buffer = new Uint8Array(await res.arrayBuffer());
+            const ct = res.headers.get("content-type") || "image/png";
+            const ext = ct.includes("jpeg") || ct.includes("jpg") ? ".jpg" : ct.includes("gif") ? ".gif" : ".png";
+            const upload = await uploadMediaWristClaw(buffer, `image${ext}`, ct, "image", {
+              serverUrl: account.serverUrl,
+              apiKey: account.apiKey,
+            });
+            if (upload.ok && upload.mediaKey) {
+              const result = await sendMessageWristClaw(to, text || "", {
+                serverUrl: account.serverUrl,
+                apiKey: account.apiKey,
+                contentType: "image",
+                mediaKey: upload.mediaKey,
+              });
+              return { channel: "wristclaw", ...result };
+            }
+          }
+        } catch { /* fall through to text fallback */ }
+      }
+
+      // Fallback: send as text with link
+      const fallbackText = text
+        ? `${text}\n\n📎 ${mediaUrl ?? "(media)"}`
+        : `📎 ${mediaUrl ?? "(media)"}`;
+
+      const result = await sendMessageWristClaw(to, fallbackText, {
+        serverUrl: account.serverUrl,
+        apiKey: account.apiKey,
+      });
+
+      return { channel: "wristclaw", ...result };
+    },
+  },
+
+  status: {
+    defaultRuntime: {
+      accountId: "default",
+      running: false,
+      lastStartAt: null,
+      lastStopAt: null,
+      lastError: null,
+    },
+
+    probeAccount: async ({ account, timeoutMs }) => {
+      return probeWristClaw(account.serverUrl, timeoutMs);
+    },
+
+    buildAccountSnapshot: ({ account, runtime }) => ({
+      accountId: account.accountId,
+      enabled: account.enabled,
+      configured: Boolean(account.apiKey?.trim()),
+      baseUrl: account.serverUrl,
+      running: runtime?.running ?? false,
+      lastStartAt: runtime?.lastStartAt ?? null,
+      lastStopAt: runtime?.lastStopAt ?? null,
+      lastError: runtime?.lastError ?? null,
+    }),
+  },
+
+  gateway: {
+    startAccount: async (ctx) => {
+      const account = ctx.account;
+      ctx.log?.info(`[${account.accountId}] starting WristClaw provider`);
+      const { monitorWristClawProvider } = await import("./monitor.js");
+      return monitorWristClawProvider({
+        account,
+        config: ctx.cfg,
+        runtime: ctx.runtime,
+        abortSignal: ctx.abortSignal,
+        statusSink: (patch) => ctx.setStatus({ ...ctx.getStatus(), ...patch }),
+      });
+    },
+  },
+
+  messaging: {
+    normalizeTarget: (raw) => raw.trim(),
+    targetResolver: {
+      looksLikeId: (raw) => /^\d+$/.test(raw.trim()),
+      hint: "<channelId>",
+    },
+  },
+};
