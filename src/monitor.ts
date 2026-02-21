@@ -93,6 +93,8 @@ async function fetchMissedMessages(
   afterMessageId: string,
   account: ResolvedWristClawAccount,
 ): Promise<APIMessage[]> {
+  if (!/^[\w-]+$/.test(channelId)) return [];
+  if (!/^[\w-]+$/.test(afterMessageId)) return [];
   const url = `${account.serverUrl}/v1/channels/${channelId}/messages?after=${afterMessageId}&limit=50`;
   const res = await fetchWithRetry(url, {
     headers: { Authorization: `Bearer ${account.apiKey}` },
@@ -140,6 +142,7 @@ async function processMessage(
   core: PluginRuntimeType,
   runtime: RuntimeEnv,
   statusSink?: WristClawMonitorOptions["statusSink"],
+  rateLimitCheck?: (senderId: string) => boolean,
 ): Promise<void> {
   const raw = event.payload;
   if (!raw) return;
@@ -157,6 +160,14 @@ async function processMessage(
   // === Echo prevention (double check: via field + sender_id) ===
   if (via === "openclaw") return;
   if (botUserId && senderId === botUserId) return;
+
+  // === Allowlist check ===
+  if (account.config.allowFrom?.length) {
+    if (!account.config.allowFrom.some((id) => String(id) === senderId)) return;
+  }
+
+  // === Per-sender rate limit (injected via closure) ===
+  if (rateLimitCheck && senderId && rateLimitCheck(senderId)) return;
 
   // Build body from content type
   let rawBody: string;
@@ -184,7 +195,9 @@ async function processMessage(
     | undefined;
   const replyQuoteText = replyTo?.text_preview || "";
   if (replyQuoteText) {
-    rawBody = `[回覆：「${replyQuoteText.slice(0, 100)}」]\n${rawBody}`;
+    // Truncate + sanitize: strip control chars, mark as user-quoted content
+    const sanitized = replyQuoteText.slice(0, 100).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "");
+    rawBody = `[回覆 (user-quoted-content)：「${sanitized}」]\n${rawBody}`;
   }
 
   // === Resolve agent route ===
@@ -401,6 +414,36 @@ export async function monitorWristClawProvider(
   // Concurrency limiter: max simultaneous AI dispatches
   const MAX_CONCURRENT = 3;
   let activeDispatches = 0;
+  // Per-sender rate limiter: max 10 messages per 60s window
+  const RATE_LIMIT_WINDOW_MS = 60_000;
+  const RATE_LIMIT_MAX = 10;
+  const senderTimestamps = new Map<string, number[]>();
+
+  function isRateLimited(senderId: string): boolean {
+    const now = Date.now();
+    let timestamps = senderTimestamps.get(senderId);
+    if (!timestamps) {
+      timestamps = [];
+      senderTimestamps.set(senderId, timestamps);
+    }
+    // Evict old entries
+    timestamps = timestamps.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+    senderTimestamps.set(senderId, timestamps);
+    if (timestamps.length >= RATE_LIMIT_MAX) return true;
+    timestamps.push(now);
+    return false;
+  }
+
+  // Periodic cleanup of stale sender entries (every 5 min)
+  const rateLimitCleanup = setInterval(() => {
+    const now = Date.now();
+    for (const [id, ts] of senderTimestamps) {
+      const fresh = ts.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+      if (fresh.length === 0) senderTimestamps.delete(id);
+      else senderTimestamps.set(id, fresh);
+    }
+  }, 300_000);
+
   let botUserId = "";
   let isFirstConnect = true;
 
@@ -411,6 +454,12 @@ export async function monitorWristClawProvider(
     }
 
     const wsUrl = account.serverUrl.replace(/^http/, "ws") + "/v1/ws";
+
+    // Warn if non-TLS to remote host (API key would be sent in cleartext)
+    if (wsUrl.startsWith("ws://") && !/localhost|127\.0\.0\.1|\[::1\]/.test(wsUrl)) {
+      runtime.error(`[wristclaw] ⚠️ WARNING: connecting to remote server without TLS — API key transmitted in cleartext! Use https/wss.`);
+    }
+
     runtime.log(`[wristclaw] connecting to ${wsUrl}`);
 
     ws = new WebSocket(wsUrl);
@@ -503,7 +552,7 @@ export async function monitorWristClawProvider(
 
                   if (activeDispatches >= MAX_CONCURRENT) continue;
                   activeDispatches++;
-                  processMessage(synth, synthChId, pairChannel, ws, botUserId, account, config, core, runtime, statusSink)
+                  processMessage(synth, synthChId, pairChannel, ws, botUserId, account, config, core, runtime, statusSink, isRateLimited)
                     .catch((err) => runtime.error(`[wristclaw] catch-up error: ${String(err)}`))
                     .finally(() => { activeDispatches--; });
                   catchUpTotal++;
@@ -561,7 +610,7 @@ export async function monitorWristClawProvider(
           return;
         }
         activeDispatches++;
-        processMessage(msg, channelId, msg.channel ?? "", ws, botUserId, account, config, core, runtime, statusSink)
+        processMessage(msg, channelId, msg.channel ?? "", ws, botUserId, account, config, core, runtime, statusSink, isRateLimited)
           .catch((err) => runtime.error(`[wristclaw] process error: ${String(err)}`))
           .finally(() => { activeDispatches--; });
         return;
@@ -604,7 +653,7 @@ export async function monitorWristClawProvider(
           return;
         }
         activeDispatches++;
-        processMessage(syntheticEvent, channelId, msg.channel ?? "", ws, botUserId, account, config, core, runtime, statusSink)
+        processMessage(syntheticEvent, channelId, msg.channel ?? "", ws, botUserId, account, config, core, runtime, statusSink, isRateLimited)
           .catch((err) => runtime.error(`[wristclaw] voice:transcribed process error: ${String(err)}`))
           .finally(() => { activeDispatches--; });
         return;
@@ -655,6 +704,7 @@ export async function monitorWristClawProvider(
 
   const stop = () => {
     stopped = true;
+    clearInterval(rateLimitCleanup);
     if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
     if (pongTimeout) { clearTimeout(pongTimeout); pongTimeout = null; }
     if (reconnectTimer) {

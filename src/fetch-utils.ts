@@ -62,8 +62,9 @@ export async function fetchWithRetry(
 
         // Retry-After header (seconds) or exponential backoff
         const retryAfter = res.headers.get("retry-after");
-        const delayMs = retryAfter
-          ? Math.min(parseInt(retryAfter, 10) * 1000, 30_000)
+        const parsedRetryAfter = retryAfter ? parseInt(retryAfter, 10) : NaN;
+        const delayMs = !isNaN(parsedRetryAfter) && parsedRetryAfter > 0
+          ? Math.min(parsedRetryAfter * 1000, 30_000)
           : RETRY_BASE_MS * Math.pow(2, attempt - 1);
         await sleep(delayMs);
         continue;

@@ -33,11 +33,19 @@ export type SendMessageResult = {
  * Send a message to a WristClaw channel.
  * POST /v1/channels/{channelId}/messages
  */
+/** Validate channelId format to prevent path injection */
+function validateChannelId(id: string): void {
+  if (!/^[\w-]+$/.test(id)) {
+    throw new Error(`invalid channelId: ${id.slice(0, 40)}`);
+  }
+}
+
 export async function sendMessageWristClaw(
   channelId: string,
   text: string,
   opts: SendMessageOptions,
 ): Promise<SendMessageResult> {
+  validateChannelId(channelId);
   const url = `${opts.serverUrl}/v1/channels/${channelId}/messages`;
 
   const body: Record<string, unknown> = {
@@ -78,9 +86,9 @@ export async function sendMessageWristClaw(
     }
 
     const errText = await res.text().catch(() => "");
-    return { ok: false, error: `HTTP ${res.status}: ${errText}` };
+    return { ok: false, error: `HTTP ${res.status}: ${errText.slice(0, 200)}` };
   } catch (err) {
-    return { ok: false, error: String(err) };
+    return { ok: false, error: String(err).slice(0, 200) };
   }
 }
 
@@ -152,6 +160,9 @@ export async function uploadMediaWristClaw(
 ): Promise<{ ok: boolean; mediaKey?: string; error?: string }> {
   const url = `${opts.serverUrl}/v1/upload`;
 
+  // Sanitize filename to prevent header injection
+  const safeFilename = filename.replace(/["\r\n\\]/g, "_");
+
   // Build multipart form data manually (Node.js)
   const boundary = `----openclaw-${Date.now()}`;
   const parts: Uint8Array[] = [];
@@ -166,7 +177,7 @@ export async function uploadMediaWristClaw(
   // file field
   parts.push(
     new TextEncoder().encode(
-      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: ${contentType}\r\n\r\n`,
+      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${safeFilename}"\r\nContent-Type: ${contentType}\r\n\r\n`,
     ),
   );
   parts.push(fileBuffer instanceof Uint8Array ? fileBuffer : new Uint8Array(fileBuffer));
@@ -197,9 +208,9 @@ export async function uploadMediaWristClaw(
       return { ok: true, mediaKey: data.media_key };
     }
     const errText = await res.text().catch(() => "");
-    return { ok: false, error: `HTTP ${res.status}: ${errText}` };
+    return { ok: false, error: `HTTP ${res.status}: ${errText.slice(0, 200)}` };
   } catch (err) {
-    return { ok: false, error: String(err) };
+    return { ok: false, error: String(err).slice(0, 200) };
   }
 }
 
