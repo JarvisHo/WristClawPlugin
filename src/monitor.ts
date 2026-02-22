@@ -57,7 +57,7 @@ type WSMessagePayload = {
   payload?: WSMessageContent;
 };
 
-/** voice:transcribed payload */
+/** voice:transcribed payload (legacy, kept for WSEvent union compat) */
 type WSVoiceTranscribedPayload = {
   pair_id?: string;
   message_id?: string;
@@ -96,7 +96,7 @@ type WSEvent =
 
 /** Max text length per outbound message chunk */
 const TEXT_LIMIT = 4000;
-/** Max cached message→author mappings (for voice:transcribed author resolution) */
+/** Max cached message→author mappings */
 const MESSAGE_AUTHOR_CAP = 500;
 /** Max tracked processed message IDs (dedup WS + catch-up overlap) */
 const DEDUP_CAP = 1000;
@@ -610,7 +610,7 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
 // ---------------------------------------------------------------------------
 
 function extractChannelId(
-  event: WSEvent & { type: "message:new" | "voice:transcribed" },
+  event: WSEvent & { type: "message:new" },
   pairToChannel: Map<string, string>,
 ): string | null {
   const payload = event.payload;
@@ -657,7 +657,7 @@ export async function monitorWristClawProvider(
   const pairToChannel = new Map<string, string>();
   // channel_id → last seen message_id (for reconnect catch-up)
   const lastSeenMessageId = new Map<string, string>();
-  // message_id → author_id cache (for voice:transcribed which lacks author_id)
+  // message_id → author_id cache (for catch-up and dedup)
   const messageAuthorMap = new Map<string, string>();
   const processedMessageIds = new Set<string>();
   // Group chat history: channel_id → recent messages (for @mention context)
@@ -1015,57 +1015,6 @@ export async function monitorWristClawProvider(
             runtime.log(`[wristclaw] message:update resolved voice waiter for ${msgId}`);
           }
         }
-        return;
-      }
-
-      // Voice transcribed (legacy) → resolve waiter or dispatch directly
-      if (msg.type === "voice:transcribed") {
-        const vPayload = msg.payload;
-        const vText = (vPayload?.text ?? "").trim();
-        if (!vText) return;
-
-        // Try to resolve a pending voice waiter first
-        const vMsgIdForWaiter = vPayload?.message_id ?? "";
-        if (vMsgIdForWaiter && resolveVoiceWaiter(vMsgIdForWaiter, vText)) {
-          runtime.log(`[wristclaw] voice:transcribed resolved waiter for ${vMsgIdForWaiter}`);
-          return;
-        }
-
-        // No waiter — legacy path: dispatch as synthetic message:new
-        // Resolve channel from pair channel
-        const channelId = extractChannelId(msg, pairToChannel);
-        if (!channelId) return;
-
-        // author_id: server includes it in voice:transcribed payload; fallback to cache
-        const vMsgId = vPayload?.message_id ?? "";
-        const cachedAuthorId = vPayload?.author_id
-          ?? (vMsgId ? messageAuthorMap.get(vMsgId) : undefined);
-
-        // Build a synthetic message:new event for processMessage
-        const syntheticEvent: WSEvent & { type: "message:new" } = {
-          type: "message:new" as const,
-          channel: msg.channel,
-          payload: {
-            pair_id: vPayload?.pair_id,
-            message_id: vMsgId || undefined,
-            channel_id: channelId,
-            author_id: cachedAuthorId,
-            payload: {
-              content_type: "voice",
-              text: vText,
-            },
-          },
-        };
-
-        statusSink?.({ lastInboundAt: Date.now() });
-        if (activeDispatches >= MAX_CONCURRENT) {
-          runtime.log(`[wristclaw] dropping voice:transcribed: ${activeDispatches} dispatches active`);
-          return;
-        }
-        activeDispatches++;
-        processMessage({ event: syntheticEvent, channelId, wsChannel: msg.channel ?? "", ws, botUserId, botDisplayName, isGroupChannel: groupChannelIds.has(channelId), account, config, core, runtime, statusSink, rateLimitCheck: isRateLimited, dedupCheck: markProcessed, groupHistories, historyLimit, waitForTranscription })
-          .catch((err) => runtime.error(`[wristclaw] voice:transcribed process error: ${String(err)}`))
-          .finally(() => { activeDispatches--; });
         return;
       }
 
