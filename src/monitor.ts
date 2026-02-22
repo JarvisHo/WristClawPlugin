@@ -1,7 +1,14 @@
 import { WebSocket } from "ws";
 import type { OpenClawConfig, RuntimeEnv } from "openclaw/plugin-sdk";
-import { createReplyPrefixOptions } from "openclaw/plugin-sdk";
-import type { ResolvedWristClawAccount, WristClawPair } from "./types.js";
+import {
+  createReplyPrefixOptions,
+  recordPendingHistoryEntryIfEnabled,
+  buildPendingHistoryContextFromMap,
+  clearHistoryEntriesIfEnabled,
+  DEFAULT_GROUP_HISTORY_LIMIT,
+  type HistoryEntry,
+} from "openclaw/plugin-sdk";
+import type { ResolvedWristClawAccount, WristClawPair, WristClawConversation } from "./types.js";
 import { getWristClawRuntime } from "./runtime.js";
 import { sendMessageWristClaw, authHeaders } from "./send.js";
 import { fetchWithRetry } from "./fetch-utils.js";
@@ -41,6 +48,7 @@ type WSReplyTo = {
 type WSMessagePayload = {
   pair_id?: string;
   author_id?: string;
+  sender_name?: string;
   channel_id?: string;
   message_id?: string;
   created_at?: string;
@@ -64,13 +72,22 @@ type WSPairCreatedPayload = {
   pair_id?: string;
 };
 
+/** group:member_added payload (sent to user:{userId} channel) */
+type WSGroupMemberAddedPayload = {
+  channel_id?: string;
+  group_name?: string;
+};
+
 type WSEvent =
   | { type: "authenticated" }
   | { type: "pong" }
   | { type: "subscribed"; channel?: string }
   | { type: "message:new"; channel?: string; payload?: WSMessagePayload }
   | { type: "voice:transcribed"; channel?: string; payload?: WSVoiceTranscribedPayload }
+  | { type: "message:update"; channel?: string; payload?: { message_id?: string; channel_id?: string; author_id?: string; text?: string; language?: string } }
   | { type: "pair:created"; channel?: string; payload?: WSPairCreatedPayload }
+  | { type: "group:member_added"; channel?: string; payload?: WSGroupMemberAddedPayload }
+  | { type: "group:member_changed"; channel?: string; payload?: unknown }
   | { type: "error"; payload?: { message?: string } };
 
 // ---------------------------------------------------------------------------
@@ -104,7 +121,9 @@ const TYPING_HEARTBEAT_MS = 3_500;
 // Pair list fetch
 // ---------------------------------------------------------------------------
 
-async function fetchBotUserId(account: ResolvedWristClawAccount): Promise<string> {
+type BotIdentity = { userId: string; displayName: string };
+
+async function fetchBotIdentity(account: ResolvedWristClawAccount): Promise<BotIdentity> {
   const res = await fetchWithRetry(`${account.serverUrl}/v1/me`, {
     headers: authHeaders(account.apiKey),
     timeoutMs: 10_000,
@@ -112,7 +131,10 @@ async function fetchBotUserId(account: ResolvedWristClawAccount): Promise<string
   });
   if (!res.ok) throw new Error(`/me failed: HTTP ${res.status}`);
   const data = await res.json();
-  return data.user_id ?? "";
+  return {
+    userId: data.user_id ?? "",
+    displayName: data.display_name ?? "",
+  };
 }
 
 async function fetchPairList(account: ResolvedWristClawAccount): Promise<WristClawPair[]> {
@@ -124,6 +146,17 @@ async function fetchPairList(account: ResolvedWristClawAccount): Promise<WristCl
   if (!res.ok) throw new Error(`pair/list failed: HTTP ${res.status}`);
   const data = await res.json();
   return data.pairs ?? [];
+}
+
+async function fetchConversations(account: ResolvedWristClawAccount): Promise<WristClawConversation[]> {
+  const res = await fetchWithRetry(`${account.serverUrl}/v1/conversations`, {
+    headers: authHeaders(account.apiKey),
+    timeoutMs: 10_000,
+    retries: 2,
+  });
+  if (!res.ok) throw new Error(`conversations failed: HTTP ${res.status}`);
+  const data = await res.json();
+  return data.conversations ?? [];
 }
 
 // ---------------------------------------------------------------------------
@@ -158,10 +191,10 @@ async function fetchMissedMessages(
   return data.messages ?? [];
 }
 
-function apiMessageToWSEvent(msg: APIMessage, pairChannel: string): WSEvent & { type: "message:new" } {
+function apiMessageToWSEvent(msg: APIMessage, wsChannel: string): WSEvent & { type: "message:new" } {
   return {
     type: "message:new" as const,
-    channel: pairChannel,
+    channel: wsChannel,
     payload: {
       message_id: msg.message_id,
       channel_id: msg.channel_id,
@@ -186,9 +219,11 @@ function apiMessageToWSEvent(msg: APIMessage, pairChannel: string): WSEvent & { 
 type ProcessMessageCtx = {
   event: WSEvent & { type: "message:new" };
   channelId: string;
-  pairChannel: string;
+  wsChannel: string;
   ws: WebSocket | null;
   botUserId: string;
+  botDisplayName: string;
+  isGroupChannel: boolean;
   account: ResolvedWristClawAccount;
   config: OpenClawConfig;
   core: PluginRuntimeType;
@@ -196,10 +231,16 @@ type ProcessMessageCtx = {
   statusSink?: WristClawMonitorOptions["statusSink"];
   rateLimitCheck?: (senderId: string) => boolean;
   dedupCheck?: (msgId: string) => boolean;
+  groupHistories: Map<string, HistoryEntry[]>;
+  historyLimit: number;
+  /** Additional image URLs for media group (first image is in event payload) */
+  extraMediaUrls?: string[];
+  /** Wait for voice transcription (defined in monitor closure) */
+  waitForTranscription?: (messageId: string) => Promise<string>;
 };
 
 async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
-  const { event, channelId, pairChannel, ws, botUserId, account, config, core, runtime, statusSink, rateLimitCheck, dedupCheck } = ctx;
+  const { event, channelId, wsChannel, ws, botUserId, botDisplayName, isGroupChannel, account, config, core, runtime, statusSink, rateLimitCheck, dedupCheck } = ctx;
   const raw = event.payload;
   if (!raw) return;
 
@@ -207,10 +248,14 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
   const via = nested?.via;
   const contentType = nested?.content_type ?? "text";
   const text = nested?.text;
-  const mediaUrl = nested?.media_url ?? raw.media_url;
+  const rawMediaUrl = nested?.media_url ?? raw.media_url;
+  // Resolve relative media URLs (server may return /media/... paths)
+  const mediaUrl = rawMediaUrl && rawMediaUrl.startsWith("/")
+    ? `${account.config.baseUrl ?? account.config.serverUrl ?? ""}${rawMediaUrl}`
+    : rawMediaUrl;
   const senderId = raw.author_id ?? "";
-  // WS broadcast doesn't include sender_name; left empty (only used for envelope label)
-  const senderName = "";
+  // WS broadcast now includes sender_name (resolved by OutboxProcessor)
+  const senderName = raw.sender_name ?? "";
 
   // === Echo prevention (double check: via field + sender_id) ===
   if (via === "openclaw") return;
@@ -220,9 +265,32 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
   const msgId = raw.message_id;
   if (msgId && dedupCheck && !dedupCheck(msgId)) return;
 
-  // === Allowlist check ===
-  if (account.config.allowFrom?.length) {
-    if (!account.config.allowFrom.some((id) => String(id) === senderId)) return;
+  // === Access policy gate (DM vs Group, modeled after Telegram plugin) ===
+  const isOwnerSender = Boolean(account.ownerUserId && senderId === account.ownerUserId);
+
+  if (ctx.isGroupChannel) {
+    // --- Group policy ---
+    const groupPolicy = account.config.groupPolicy ?? "mention";
+    if (groupPolicy === "disabled") return;
+
+    // Group allowFrom: optional per-group sender filter
+    const groupAllowFrom = account.config.groupAllowFrom;
+    if (groupAllowFrom?.length) {
+      const isWildcard = groupAllowFrom.some((id) => String(id).trim() === "*");
+      if (!isWildcard && !isOwnerSender) {
+        if (!groupAllowFrom.some((id) => String(id) === senderId)) return;
+      }
+    }
+  } else {
+    // --- DM policy ---
+    const dmPolicy = account.config.dmPolicy ?? "open";
+    if (dmPolicy === "disabled" && !isOwnerSender) return;
+    if (dmPolicy === "allowlist" && !isOwnerSender) {
+      const allowFrom = account.config.allowFrom;
+      if (!allowFrom?.length) return; // no allowlist entries = block all
+      const isWildcard = allowFrom.some((id) => String(id).trim() === "*");
+      if (!isWildcard && !allowFrom.some((id) => String(id) === senderId)) return;
+    }
   }
 
   // === Per-sender rate limit (injected via closure) ===
@@ -233,13 +301,19 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
   if (contentType === "text") {
     rawBody = text?.trim() ?? "";
   } else if (contentType === "voice") {
-    // If no transcription yet, skip — will be handled by voice:transcribed event
-    const t = text?.trim();
-    if (!t) return;
-    rawBody = t;
+    let t = text?.trim();
+    if (!t) {
+      // No transcription yet — wait for message:update from server
+      const msgId = raw.message_id;
+      if (msgId) {
+        runtime.log(`[wristclaw] voice message ${msgId}: waiting for transcription...`);
+        t = ctx.waitForTranscription ? (await ctx.waitForTranscription(msgId)).trim() : "";
+      }
+    }
+    rawBody = t || "🎤 語音訊息";
   } else if (contentType === "image") {
-    rawBody = text?.trim() || "📷 圖片";
-    // mediaUrl will be passed to inbound context below
+    const imageCount = 1 + (ctx.extraMediaUrls?.length ?? 0);
+    rawBody = text?.trim() || (imageCount > 1 ? `📷 ${imageCount} 張圖片` : "📷 圖片");
   } else if (contentType === "interactive") {
     rawBody = text?.trim() || "📋 互動訊息";
   } else {
@@ -247,6 +321,82 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
   }
 
   if (!rawBody) return;
+
+  // === Download image(s) to local storage for vision model ===
+  let imageMediaPaths: string[] = [];
+  if (contentType === "image") {
+    runtime.log(`[wristclaw] image msg: mediaUrl=${mediaUrl}, rawMediaUrl=${nested?.media_url ?? raw.media_url}, raw keys=${Object.keys(raw ?? {})}, nested keys=${Object.keys(nested ?? {})}`);
+  }
+  if (contentType === "image" && mediaUrl) {
+    const allUrls = [mediaUrl, ...(ctx.extraMediaUrls ?? [])];
+    const downloadResults = await Promise.allSettled(
+      allUrls.map(async (url) => {
+        try {
+          const fetched = await core.channel.media.fetchRemoteMedia({ url, maxBytes: 10 * 1024 * 1024 });
+          const saved = await core.channel.media.saveMediaBuffer(fetched.buffer, fetched.contentType ?? "image/jpeg", "inbound");
+          return saved.path;
+        } catch (err) {
+          runtime.error(`[wristclaw] image download failed: ${String(err)}`);
+          return null;
+        }
+      })
+    );
+    imageMediaPaths = downloadResults
+      .map(r => r.status === "fulfilled" ? r.value : null)
+      .filter((p): p is string => p !== null);
+  }
+
+  // === Group history + @mention gate ===
+  const historyKey = ctx.isGroupChannel ? channelId : "";
+  const { historyLimit, groupHistories } = ctx;
+
+  if (ctx.isGroupChannel) {
+    const groupPolicy = account.config.groupPolicy ?? "mention";
+
+    // Build sender label for history (use senderId as fallback)
+    const senderLabel = senderName || `user:${senderId.slice(0, 8)}`;
+
+    if (groupPolicy === "mention") {
+      // Resolve mention names for @mention detection
+      const mentionNames: string[] = [];
+      const cfgMention = account.config.mentionNames;
+      if (Array.isArray(cfgMention)) {
+        for (const n of cfgMention) if (typeof n === "string" && n) mentionNames.push(n.toLowerCase());
+      }
+      if (ctx.botDisplayName) {
+        const bn = ctx.botDisplayName.toLowerCase();
+        if (!mentionNames.includes(bn)) mentionNames.push(bn);
+      }
+      mentionNames.push("all");
+
+      const rawText = rawBody.toLowerCase();
+      const isMentioned = mentionNames.some(name => rawText.includes(`@${name}`));
+
+      if (!isMentioned) {
+        // Not mentioned → record to history and return (don't dispatch to AI)
+        recordPendingHistoryEntryIfEnabled({
+          historyMap: groupHistories,
+          historyKey,
+          limit: historyLimit,
+          entry: historyKey ? {
+            sender: senderLabel,
+            body: rawBody,
+            timestamp: raw.created_at ? new Date(raw.created_at).getTime() : Date.now(),
+            messageId: raw.message_id,
+          } : null,
+        });
+        return;
+      }
+
+      // Mentioned → strip @mention from rawBody
+      for (const name of mentionNames) {
+        rawBody = rawBody.replace(new RegExp(`@${name}\\s*`, "gi"), "");
+      }
+      rawBody = rawBody.trim();
+      if (!rawBody) return;
+    }
+    // groupPolicy="open": fall through (no mention check, no history needed)
+  }
 
   // === Parse reply context for AI ===
   const replyTo = raw.reply_to;
@@ -259,7 +409,7 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
 
   // === Resolve agent route ===
   // Both owner and visitors get per-channel isolated sessions (no main session pollution)
-  const isOwner = Boolean(account.ownerUserId && senderId === account.ownerUserId);
+  const isOwner = isOwnerSender;
 
   const baseRoute = core.channel.routing.resolveAgentRoute({
     cfg: config,
@@ -301,9 +451,31 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
     body: rawBody,
   });
 
+  // === Build combined body with group chat history ===
+  let combinedBody = envelope;
+  let inboundHistory: HistoryEntry[] | undefined;
+  if (ctx.isGroupChannel && historyKey && historyLimit > 0) {
+    combinedBody = buildPendingHistoryContextFromMap({
+      historyMap: groupHistories,
+      historyKey,
+      limit: historyLimit,
+      currentMessage: combinedBody,
+      formatEntry: (entry) => {
+        const ts = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit" }) : "";
+        return `[${ts}] ${entry.sender}: ${entry.body}`;
+      },
+    });
+    inboundHistory = (groupHistories.get(historyKey) ?? []).map((entry) => ({
+      sender: entry.sender,
+      body: entry.body,
+      timestamp: entry.timestamp,
+    }));
+  }
+
   const ctxPayload = core.channel.reply.finalizeInboundContext({
-    Body: envelope,
+    Body: combinedBody,
     BodyForAgent: rawBody,
+    InboundHistory: inboundHistory,
     RawBody: rawBody,
     CommandBody: rawBody,
     CommandAuthorized: isOwner,
@@ -323,8 +495,16 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
     ReplyToSender: replyTo?.author_id,
     OriginatingChannel: "wristclaw" as const,
     OriginatingTo: `wristclaw:${channelId}`,
-    // Image: pass media URL for vision model
-    ...(contentType === "image" && mediaUrl ? { MediaUrl: mediaUrl, MediaType: "image" } : {}),
+    // Image: pass local media path(s) for vision model (matches Telegram plugin pattern)
+    ...(imageMediaPaths.length > 1
+      ? {
+          MediaPath: imageMediaPaths[0], MediaUrl: imageMediaPaths[0], MediaType: "image",
+          MediaPaths: imageMediaPaths, MediaUrls: imageMediaPaths,
+          MediaTypes: imageMediaPaths.map(() => "image"),
+        }
+      : imageMediaPaths.length === 1
+        ? { MediaPath: imageMediaPaths[0], MediaUrl: imageMediaPaths[0], MediaType: "image" }
+        : {}),
   });
 
   // === Record session ===
@@ -351,7 +531,7 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
           type: "typing",
-          channel: pairChannel,
+          channel: wsChannel,
           payload: { status },
         }));
       }
@@ -414,6 +594,14 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
     });
   } finally {
     clearInterval(typingInterval);
+    // Clear group history after reply (same as Telegram: history is consumed)
+    if (ctx.isGroupChannel && historyKey) {
+      clearHistoryEntriesIfEnabled({
+        historyMap: groupHistories,
+        historyKey,
+        limit: historyLimit,
+      });
+    }
   }
 }
 
@@ -435,12 +623,9 @@ function extractChannelId(
   if (pairId && pairToChannel.has(pairId)) {
     return pairToChannel.get(pairId)!;
   }
-  // Try from WS channel field: "pair:<uuid>"
-  if (event.channel?.startsWith("pair:")) {
-    const pid = event.channel.slice(5);
-    if (pairToChannel.has(pid)) {
-      return pairToChannel.get(pid)!;
-    }
+  // From WS channel field: "channel:<channelId>"
+  if (event.channel?.startsWith("channel:")) {
+    return event.channel.slice(8);
   }
   return null;
 }
@@ -475,7 +660,113 @@ export async function monitorWristClawProvider(
   // message_id → author_id cache (for voice:transcribed which lacks author_id)
   const messageAuthorMap = new Map<string, string>();
   const processedMessageIds = new Set<string>();
+  // Group chat history: channel_id → recent messages (for @mention context)
+  const groupHistories = new Map<string, HistoryEntry[]>();
+  const historyLimit = account.config.historyLimit ?? DEFAULT_GROUP_HISTORY_LIMIT;
   let activeDispatches = 0;
+
+  // --- Media group buffer: batch rapid image messages from same sender ---
+  const MEDIA_GROUP_DELAY_MS = 800;
+  type WSMessageNewEvent = WSEvent & { type: "message:new" };
+  type MediaGroupEntry = {
+    event: WSMessageNewEvent;
+    channelId: string;
+    wsChannel: string;
+    extraMediaUrls: string[];
+    timer: ReturnType<typeof setTimeout>;
+  };
+  const mediaGroupBuffer = new Map<string, MediaGroupEntry>();
+
+  function flushMediaGroup(key: string) {
+    const entry = mediaGroupBuffer.get(key);
+    if (!entry) return;
+    mediaGroupBuffer.delete(key);
+
+    if (activeDispatches >= MAX_CONCURRENT) {
+      runtime.log(`[wristclaw] dropping media group: ${activeDispatches} dispatches active`);
+      return;
+    }
+    activeDispatches++;
+    processMessage({
+      event: entry.event, channelId: entry.channelId, wsChannel: entry.wsChannel, ws, botUserId, botDisplayName,
+      isGroupChannel: groupChannelIds.has(entry.channelId), account, config, core, runtime, statusSink,
+      rateLimitCheck: isRateLimited, dedupCheck: markProcessed, groupHistories, historyLimit,
+      extraMediaUrls: entry.extraMediaUrls.length > 0 ? entry.extraMediaUrls : undefined,
+      waitForTranscription,
+    })
+      .catch((err) => runtime.error(`[wristclaw] process error: ${String(err)}`))
+      .finally(() => { activeDispatches--; });
+  }
+
+  function bufferOrFlushImage(msg: WSMessageNewEvent, channelId: string, wsChannel: string): boolean {
+    const nested = msg.payload?.payload;
+    const contentType = nested?.content_type ?? "text";
+    if (contentType !== "image") {
+      // Non-image message from same sender: flush any buffered group immediately
+      const senderId = msg.payload?.author_id ?? "";
+      const key = `${channelId}:${senderId}`;
+      if (mediaGroupBuffer.has(key)) {
+        clearTimeout(mediaGroupBuffer.get(key)!.timer);
+        flushMediaGroup(key);
+      }
+      return false; // not buffered, let caller handle normally
+    }
+
+    const senderId = msg.payload?.author_id ?? "";
+    const rawUrl = nested?.media_url ?? msg.payload?.media_url;
+    const mediaUrl = rawUrl && rawUrl.startsWith("/")
+      ? `${account.config.baseUrl ?? account.config.serverUrl ?? ""}${rawUrl}`
+      : rawUrl;
+    const key = `${channelId}:${senderId}`;
+
+    const existing = mediaGroupBuffer.get(key);
+    if (existing) {
+      // Add to existing group
+      clearTimeout(existing.timer);
+      if (mediaUrl) existing.extraMediaUrls.push(mediaUrl);
+      existing.timer = setTimeout(() => flushMediaGroup(key), MEDIA_GROUP_DELAY_MS);
+    } else {
+      // Start new group — first image becomes the "primary" event
+      const timer = setTimeout(() => flushMediaGroup(key), MEDIA_GROUP_DELAY_MS);
+      mediaGroupBuffer.set(key, {
+        event: msg,
+        channelId,
+        wsChannel,
+        extraMediaUrls: [],
+        timer,
+      });
+    }
+    return true; // buffered
+  }
+  // --- Voice transcription waiter: wait for message:update before dispatching ---
+  const VOICE_WAIT_MS = 15_000;
+  type VoiceWaiter = {
+    resolve: (text: string) => void;
+    timer: ReturnType<typeof setTimeout>;
+  };
+  const voiceWaiters = new Map<string, VoiceWaiter>();
+
+  /** Wait for transcription text via message:update. Returns text or empty string on timeout. */
+  function waitForTranscription(messageId: string): Promise<string> {
+    return new Promise<string>((resolve) => {
+      const timer = setTimeout(() => {
+        voiceWaiters.delete(messageId);
+        resolve(""); // timeout — no transcription
+      }, VOICE_WAIT_MS);
+      voiceWaiters.set(messageId, { resolve, timer });
+    });
+  }
+
+  /** Called when message:update arrives — resolves the waiter if any. */
+  function resolveVoiceWaiter(messageId: string, text: string): boolean {
+    const waiter = voiceWaiters.get(messageId);
+    if (!waiter) return false;
+    clearTimeout(waiter.timer);
+    voiceWaiters.delete(messageId);
+    waiter.resolve(text);
+    return true;
+  }
+
   const senderTimestamps = new Map<string, number[]>();
 
   function isRateLimited(senderId: string): boolean {
@@ -518,6 +809,8 @@ export async function monitorWristClawProvider(
   }
 
   let botUserId = "";
+  let botDisplayName = "";
+  const groupChannelIds = new Set<string>();
   let isFirstConnect = true;
 
   const connect = () => {
@@ -583,41 +876,60 @@ export async function monitorWristClawProvider(
           }, PONG_TIMEOUT_MS);
         }, PING_INTERVAL_MS);
 
-        runtime.log("[wristclaw] authenticated, fetching pairs...");
+        runtime.log("[wristclaw] authenticated, fetching conversations...");
 
         try {
-          // Resolve bot's own user_id for echo prevention
+          // Resolve bot's own identity for echo prevention + @mention detection
           if (!botUserId) {
-            botUserId = await fetchBotUserId(account);
-            runtime.log(`[wristclaw] bot user_id: ${botUserId}`);
+            const identity = await fetchBotIdentity(account);
+            botUserId = identity.userId;
+            botDisplayName = identity.displayName;
+            runtime.log(`[wristclaw] bot user_id: ${botUserId}, name: ${botDisplayName || "(none)"}`);
           }
-          const pairs = await fetchPairList(account);
+
+          // Subscribe to user channel for group:member_added + pair:created
+          safeSend(JSON.stringify({ type: "subscribe", channel: `user:${botUserId}` }));
+
+          // Fetch all conversations (pairs + groups) and subscribe
+          const conversations = await fetchConversations(account);
           pairToChannel.clear();
-          for (const pair of pairs) {
-            pairToChannel.set(pair.pair_id, pair.channel_id);
-            safeSend(JSON.stringify({
-              type: "subscribe",
-              channel: `pair:${pair.pair_id}`,
-            }));
+          groupChannelIds.clear();
+          const subscribedChannels = new Set<string>();
+          for (const conv of conversations) {
+            if (conv.type === "pair" && conv.pair_id) {
+              pairToChannel.set(conv.pair_id, conv.channel_id);
+            }
+            if (conv.type === "group") {
+              groupChannelIds.add(conv.channel_id);
+            }
+            if (conv.channel_id && !subscribedChannels.has(conv.channel_id)) {
+              subscribedChannels.add(conv.channel_id);
+              safeSend(JSON.stringify({
+                type: "subscribe",
+                channel: `channel:${conv.channel_id}`,
+              }));
+            }
           }
-          runtime.log(`[wristclaw] monitoring ${pairs.length} pairs`);
+          const pairCount = conversations.filter(c => c.type === "pair").length;
+          const groupCount = conversations.filter(c => c.type === "group").length;
+          runtime.log(`[wristclaw] monitoring ${pairCount} pairs, ${groupCount} groups`);
 
           // Catch-up: fetch missed messages during disconnect (skip first connect)
           if (!isFirstConnect) {
             let catchUpTotal = 0;
-            for (const pair of pairs) {
-              const chId = pair.channel_id;
+            for (const conv of conversations) {
+              const chId = conv.channel_id;
+              if (!chId) continue;
               const lastId = lastSeenMessageId.get(chId);
               if (!lastId) continue;
               try {
                 const missed = await fetchMissedMessages(chId, lastId, account);
                 for (const m of missed) {
-                  // Skip own messages (echo prevention)
                   if (m.payload?.via === "openclaw") continue;
                   if (botUserId && m.author_id === botUserId) continue;
 
-                  const pairChannel = `pair:${pair.pair_id}`;
-                  const synth = apiMessageToWSEvent(m, pairChannel);
+                  const wsChannel = `channel:${chId}`;
+                  const synth = apiMessageToWSEvent(m, wsChannel);
                   const synthChId = extractChannelId(synth, pairToChannel);
                   if (!synthChId) continue;
 
@@ -625,7 +937,7 @@ export async function monitorWristClawProvider(
 
                   if (activeDispatches >= MAX_CONCURRENT) continue;
                   activeDispatches++;
-                  processMessage({ event: synth, channelId: synthChId, pairChannel, ws, botUserId, account, config, core, runtime, statusSink, rateLimitCheck: isRateLimited, dedupCheck: markProcessed })
+                  processMessage({ event: synth, channelId: synthChId, wsChannel, ws, botUserId, botDisplayName, isGroupChannel: groupChannelIds.has(synthChId), account, config, core, runtime, statusSink, rateLimitCheck: isRateLimited, dedupCheck: markProcessed, groupHistories, historyLimit, waitForTranscription })
                     .catch((err) => runtime.error(`[wristclaw] catch-up error: ${String(err)}`))
                     .finally(() => { activeDispatches--; });
                   catchUpTotal++;
@@ -678,23 +990,48 @@ export async function monitorWristClawProvider(
 
         statusSink?.({ lastInboundAt: Date.now() });
 
+        // Media group: buffer rapid sequential images from same sender
+        const wsChannel = msg.channel ?? "";
+        if (bufferOrFlushImage(msg, channelId, wsChannel)) return; // buffered, will dispatch later
+
         if (activeDispatches >= MAX_CONCURRENT) {
           runtime.log(`[wristclaw] dropping message: ${activeDispatches} dispatches active`);
           return;
         }
         activeDispatches++;
-        processMessage({ event: msg, channelId, pairChannel: msg.channel ?? "", ws, botUserId, account, config, core, runtime, statusSink, rateLimitCheck: isRateLimited, dedupCheck: markProcessed })
+        processMessage({ event: msg, channelId, wsChannel, ws, botUserId, botDisplayName, isGroupChannel: groupChannelIds.has(channelId), account, config, core, runtime, statusSink, rateLimitCheck: isRateLimited, dedupCheck: markProcessed, groupHistories, historyLimit, waitForTranscription })
           .catch((err) => runtime.error(`[wristclaw] process error: ${String(err)}`))
           .finally(() => { activeDispatches--; });
         return;
       }
 
-      // Voice transcribed → dispatch transcription text to AI
+      // message:update → resolve voice transcription waiters
+      if (msg.type === "message:update") {
+        const uPayload = msg.payload;
+        const msgId = uPayload?.message_id ?? "";
+        const uText = uPayload?.text ?? "";
+        if (msgId && uText) {
+          if (resolveVoiceWaiter(msgId, uText)) {
+            runtime.log(`[wristclaw] message:update resolved voice waiter for ${msgId}`);
+          }
+        }
+        return;
+      }
+
+      // Voice transcribed (legacy) → resolve waiter or dispatch directly
       if (msg.type === "voice:transcribed") {
         const vPayload = msg.payload;
         const vText = (vPayload?.text ?? "").trim();
         if (!vText) return;
 
+        // Try to resolve a pending voice waiter first
+        const vMsgIdForWaiter = vPayload?.message_id ?? "";
+        if (vMsgIdForWaiter && resolveVoiceWaiter(vMsgIdForWaiter, vText)) {
+          runtime.log(`[wristclaw] voice:transcribed resolved waiter for ${vMsgIdForWaiter}`);
+          return;
+        }
+
+        // No waiter — legacy path: dispatch as synthetic message:new
         // Resolve channel from pair channel
         const channelId = extractChannelId(msg, pairToChannel);
         if (!channelId) return;
@@ -726,14 +1063,28 @@ export async function monitorWristClawProvider(
           return;
         }
         activeDispatches++;
-        processMessage({ event: syntheticEvent, channelId, pairChannel: msg.channel ?? "", ws, botUserId, account, config, core, runtime, statusSink, rateLimitCheck: isRateLimited, dedupCheck: markProcessed })
+        processMessage({ event: syntheticEvent, channelId, wsChannel: msg.channel ?? "", ws, botUserId, botDisplayName, isGroupChannel: groupChannelIds.has(channelId), account, config, core, runtime, statusSink, rateLimitCheck: isRateLimited, dedupCheck: markProcessed, groupHistories, historyLimit, waitForTranscription })
           .catch((err) => runtime.error(`[wristclaw] voice:transcribed process error: ${String(err)}`))
           .finally(() => { activeDispatches--; });
         return;
       }
 
-      // New pair created → subscribe
-      // TODO: if server includes channel_id in pair:created payload, avoid full re-fetch
+      // Bot added to a group → subscribe to its channel
+      if (msg.type === "group:member_added" && msg.payload) {
+        const chId = msg.payload.channel_id;
+        const gName = msg.payload.group_name ?? "group";
+        if (chId) {
+          groupChannelIds.add(chId);
+          safeSend(JSON.stringify({ type: "subscribe", channel: `channel:${chId}` }));
+          runtime.log(`[wristclaw] joined group "${gName}" (channel:${chId})`);
+        }
+        return;
+      }
+
+      // Ignore group:member_changed (informational only for plugin)
+      if (msg.type === "group:member_changed") return;
+
+      // New pair created → subscribe to its channel
       if (msg.type === "pair:created" && msg.payload) {
         const pairId = msg.payload.pair_id;
         if (pairId) {
@@ -744,9 +1095,9 @@ export async function monitorWristClawProvider(
                 pairToChannel.set(pair.pair_id, pair.channel_id);
                 safeSend(JSON.stringify({
                   type: "subscribe",
-                  channel: `pair:${pair.pair_id}`,
+                  channel: `channel:${pair.channel_id}`,
                 }));
-                runtime.log(`[wristclaw] subscribed new pair ${pair.pair_id}`);
+                runtime.log(`[wristclaw] subscribed new pair ${pair.pair_id} (channel:${pair.channel_id})`);
               }
             }
           } catch (err) {
@@ -778,6 +1129,17 @@ export async function monitorWristClawProvider(
   const stop = () => {
     stopped = true;
     clearInterval(rateLimitCleanup);
+    // Flush pending media groups on shutdown
+    for (const [key, entry] of mediaGroupBuffer) {
+      clearTimeout(entry.timer);
+      flushMediaGroup(key);
+    }
+    // Cancel pending voice waiters
+    for (const [id, waiter] of voiceWaiters) {
+      clearTimeout(waiter.timer);
+      waiter.resolve("");
+    }
+    voiceWaiters.clear();
     if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
     if (pongTimeout) { clearTimeout(pongTimeout); pongTimeout = null; }
     if (reconnectTimer) {
