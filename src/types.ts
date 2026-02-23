@@ -10,9 +10,27 @@ export type BaseResult = {
   error?: string;
 };
 
+/** Per-account config (used inside accounts map or as top-level legacy) */
+export type WristClawAccountConfig = {
+  enabled?: boolean;
+  serverUrl?: string;
+  baseUrl?: string;
+  apiKey?: string;
+  ownerUserId?: string;
+  secretaryAgentId?: string;
+  dmPolicy?: "open" | "allowlist" | "disabled";
+  allowFrom?: Array<string | number>;
+  groupPolicy?: "mention" | "open" | "disabled";
+  groupAllowFrom?: Array<string | number>;
+  mentionNames?: string[];
+  historyLimit?: number;
+};
+
 /** WristClaw channel config shape (channels.wristclaw in openclaw.json) */
 export type WristClawChannelConfig = {
   enabled?: boolean;
+  /** Multi-account mode: each key is an account ID */
+  accounts?: Record<string, WristClawAccountConfig>;
   serverUrl?: string;
   baseUrl?: string;
   apiKey?: string;

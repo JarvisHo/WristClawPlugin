@@ -108,6 +108,24 @@ const RATE_LIMIT_MAX = 10;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 /** Rate limit map cleanup interval (ms) */
 const RATE_LIMIT_CLEANUP_MS = 300_000;
+/** Cross-account dedup: shared across all account monitors to prevent
+ *  duplicate AI dispatch when multiple accounts see the same channel. */
+const CROSS_ACCOUNT_DEDUP_CAP = 2000;
+const crossAccountProcessed = new Map<string, number>(); // messageId → timestamp
+
+function crossAccountDedup(msgId: string): boolean {
+  if (crossAccountProcessed.has(msgId)) return false; // already claimed
+  crossAccountProcessed.set(msgId, Date.now());
+  // Evict old entries
+  if (crossAccountProcessed.size > CROSS_ACCOUNT_DEDUP_CAP) {
+    const cutoff = Date.now() - 300_000; // 5 min
+    for (const [id, ts] of crossAccountProcessed) {
+      if (ts < cutoff) crossAccountProcessed.delete(id);
+    }
+  }
+  return true; // first claim
+}
+
 /** WS keepalive ping interval (ms) */
 const PING_INTERVAL_MS = 30_000;
 /** WS pong response timeout — force reconnect if exceeded (ms) */
@@ -239,6 +257,21 @@ type ProcessMessageCtx = {
   waitForTranscription?: (messageId: string) => Promise<string>;
 };
 
+/** Validate that a media URL is safe to fetch (same origin as server, or relative) */
+function isSafeMediaUrl(url: string, serverUrl: string): boolean {
+  if (!url) return false;
+  // Relative paths are always safe (resolved to server origin)
+  if (url.startsWith("/")) return true;
+  try {
+    const parsed = new URL(url);
+    const server = new URL(serverUrl);
+    // Only allow same hostname as the configured server
+    return parsed.hostname === server.hostname;
+  } catch {
+    return false;
+  }
+}
+
 async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
   const { event, channelId, wsChannel, ws, botUserId, botDisplayName, isGroupChannel, account, config, core, runtime, statusSink, rateLimitCheck, dedupCheck } = ctx;
   const raw = event.payload;
@@ -261,8 +294,11 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
   if (via === "openclaw") return;
   if (botUserId && senderId === botUserId) return;
 
-  // === Dedup check ===
+  // === Cross-account dedup (prevents double reply when multiple accounts see same channel) ===
   const msgId = raw.message_id;
+  if (msgId && !crossAccountDedup(msgId)) return;
+
+  // === Per-account dedup check (WS reconnect catch-up overlap) ===
   if (msgId && dedupCheck && !dedupCheck(msgId)) return;
 
   // === Access policy gate (DM vs Group, modeled after Telegram plugin) ===
@@ -328,7 +364,12 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
     runtime.log(`[wristclaw] image msg: mediaUrl=${mediaUrl}, rawMediaUrl=${nested?.media_url ?? raw.media_url}, raw keys=${Object.keys(raw ?? {})}, nested keys=${Object.keys(nested ?? {})}`);
   }
   if (contentType === "image" && mediaUrl) {
-    const allUrls = [mediaUrl, ...(ctx.extraMediaUrls ?? [])];
+    const allUrls = [mediaUrl, ...(ctx.extraMediaUrls ?? [])].filter(
+      (u) => isSafeMediaUrl(u, account.serverUrl),
+    );
+    if (allUrls.length === 0 && mediaUrl) {
+      runtime.error(`[wristclaw] SSRF blocked: media URL not same-origin: ${mediaUrl.slice(0, 100)}`);
+    }
     const downloadResults = await Promise.allSettled(
       allUrls.map(async (url) => {
         try {
@@ -423,9 +464,12 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
     : (account.config.secretaryAgentId ?? baseRoute.agentId);
 
   // All WristClaw users get per-channel sessions (owner included)
+  // Session key uses fixed "wristclaw" prefix (not agentId) for stable keys across routing changes
   const route = {
     agentId,
-    sessionKey: `agent:${agentId}:wristclaw:${isOwner ? "direct" : "group"}:ch:${channelId}`,
+    sessionKey: account.accountId === "default"
+      ? `agent:wristclaw:${isOwner ? "direct" : "group"}:ch:${channelId}`
+      : `agent:wristclaw:${account.accountId}:${isOwner ? "direct" : "group"}:ch:${channelId}`,
     accountId: account.accountId,
   };
 
@@ -821,9 +865,11 @@ export async function monitorWristClawProvider(
 
     const wsUrl = account.serverUrl.replace(/^http/, "ws") + "/v1/ws";
 
-    // Warn if non-TLS to remote host (API key would be sent in cleartext)
+    // Block non-TLS to remote host (API key would be sent in cleartext)
     if (wsUrl.startsWith("ws://") && !/localhost|127\.0\.0\.1|\[::1\]/.test(wsUrl)) {
-      runtime.error(`[wristclaw] ⚠️ WARNING: connecting to remote server without TLS — API key transmitted in cleartext! Use https/wss.`);
+      runtime.error(`[wristclaw] BLOCKED: refusing ws:// to remote host — use https/wss to protect API key. URL: ${wsUrl}`);
+      resolveRunning?.();
+      return;
     }
 
     runtime.log(`[wristclaw] connecting to ${wsUrl}`);

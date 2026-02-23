@@ -4,6 +4,7 @@ import { resolveWristClawAccount, listWristClawAccountIds } from "./config.js";
 import { sendMessageWristClaw, uploadMediaWristClaw, probeWristClaw, parseInteractiveButtons, type InteractivePayload } from "./send.js";
 import { fetchWithRetry } from "./fetch-utils.js";
 import { getWristClawRuntime } from "./runtime.js";
+import { monitorWristClawProvider } from "./monitor.js";
 
 /** channelData.wristclaw shape from OpenClaw core */
 type WristClawChannelData = {
@@ -71,8 +72,8 @@ export const wristclawPlugin: ChannelPlugin<ResolvedWristClawAccount> = {
       getWristClawRuntime().channel.text.chunkMarkdownText(text, limit),
     chunkerMode: "markdown",
 
-    sendText: async ({ to, text, cfg, replyToId }) => {
-      const account = resolveWristClawAccount({ cfg });
+    sendText: async ({ to, text, cfg, replyToId, accountId }) => {
+      const account = resolveWristClawAccount({ cfg, accountId });
       if (!account.apiKey) {
         return { ok: false, error: "WristClaw API key not configured" };
       }
@@ -101,9 +102,9 @@ export const wristclawPlugin: ChannelPlugin<ResolvedWristClawAccount> = {
       return { channel: "wristclaw", ...result };
     },
 
-    sendPayload: async ({ to, text: rawText, payload, cfg }) => {
+    sendPayload: async ({ to, text: rawText, payload, cfg, accountId }) => {
       let text = rawText;
-      const account = resolveWristClawAccount({ cfg });
+      const account = resolveWristClawAccount({ cfg, accountId });
       if (!account.apiKey) {
         return { ok: false, error: "WristClaw API key not configured" };
       }
@@ -165,8 +166,8 @@ export const wristclawPlugin: ChannelPlugin<ResolvedWristClawAccount> = {
       return { channel: "wristclaw", ...result };
     },
 
-    sendMedia: async ({ to, text, mediaUrl, cfg }) => {
-      const account = resolveWristClawAccount({ cfg });
+    sendMedia: async ({ to, text, mediaUrl, cfg, accountId }) => {
+      const account = resolveWristClawAccount({ cfg, accountId });
       if (!account.apiKey) {
         return { ok: false, error: "WristClaw API key not configured" };
       }
@@ -239,7 +240,6 @@ export const wristclawPlugin: ChannelPlugin<ResolvedWristClawAccount> = {
     startAccount: async (ctx) => {
       const account = ctx.account;
       ctx.log?.info(`[wristclaw] starting provider (account: ${account.accountId})`);
-      const { monitorWristClawProvider } = await import("./monitor.js");
       return monitorWristClawProvider({
         account,
         config: ctx.cfg,
