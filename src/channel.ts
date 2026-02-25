@@ -1,8 +1,8 @@
 import type { ChannelPlugin, ChannelAccountSnapshot, OpenClawConfig } from "openclaw/plugin-sdk";
+import { loadWebMedia } from "openclaw/plugin-sdk";
 import type { ResolvedWristClawAccount } from "./types.js";
 import { resolveWristClawAccount, listWristClawAccountIds } from "./config.js";
 import { sendMessageWristClaw, uploadMediaWristClaw, probeWristClaw, parseInteractiveButtons, type InteractivePayload } from "./send.js";
-import { fetchWithRetry } from "./fetch-utils.js";
 import { getWristClawRuntime } from "./runtime.js";
 import { monitorWristClawProvider } from "./monitor.js";
 
@@ -166,35 +166,40 @@ export const wristclawPlugin: ChannelPlugin<ResolvedWristClawAccount> = {
       return { channel: "wristclaw", ...result };
     },
 
-    sendMedia: async ({ to, text, mediaUrl, cfg, accountId }) => {
+    sendMedia: async ({ to, text, mediaUrl, mediaLocalRoots, cfg, accountId }) => {
       const account = resolveWristClawAccount({ cfg, accountId });
       if (!account.apiKey) {
         return { ok: false, error: "WristClaw API key not configured" };
       }
 
-      // Try to download and upload image
       if (mediaUrl) {
         try {
-          const res = await fetchWithRetry(mediaUrl, { timeoutMs: 15_000, retries: 1 });
-          if (res.ok) {
-            const buffer = new Uint8Array(await res.arrayBuffer());
-            const ct = res.headers.get("content-type") || "image/png";
-            const ext = ct.includes("jpeg") || ct.includes("jpg") ? ".jpg" : ct.includes("gif") ? ".gif" : ".png";
-            const upload = await uploadMediaWristClaw(buffer, `image${ext}`, ct, "image", {
+          // Use framework's loadWebMedia — supports file://, HTTP, localRoots
+          const media = await loadWebMedia(mediaUrl, {
+            localRoots: mediaLocalRoots,
+          });
+
+          const ct = media.contentType || "image/png";
+          const ext = ct.includes("jpeg") || ct.includes("jpg") ? ".jpg" : ct.includes("gif") ? ".gif" : ".png";
+          const fileName = media.fileName || `image${ext}`;
+
+          const upload = await uploadMediaWristClaw(media.buffer, fileName, ct, "image", {
+            serverUrl: account.serverUrl,
+            apiKey: account.apiKey,
+          });
+
+          if (upload.ok && upload.mediaKey) {
+            const result = await sendMessageWristClaw(to, text || "", {
               serverUrl: account.serverUrl,
               apiKey: account.apiKey,
+              contentType: "image",
+              mediaKey: upload.mediaKey,
             });
-            if (upload.ok && upload.mediaKey) {
-              const result = await sendMessageWristClaw(to, text || "", {
-                serverUrl: account.serverUrl,
-                apiKey: account.apiKey,
-                contentType: "image",
-                mediaKey: upload.mediaKey,
-              });
-              return { channel: "wristclaw", ...result };
-            }
+            return { channel: "wristclaw", ...result };
           }
-        } catch { /* fall through to text fallback */ }
+        } catch (err) {
+          console.error(`[wristclaw] sendMedia error: ${err}`);
+        }
       }
 
       // Fallback: send as text with link
