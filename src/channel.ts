@@ -3,8 +3,9 @@ import { loadWebMedia } from "openclaw/plugin-sdk";
 import type { ResolvedWristClawAccount } from "./types.js";
 import { resolveWristClawAccount, listWristClawAccountIds } from "./config.js";
 import { sendMessageWristClaw, uploadMediaWristClaw, probeWristClaw, parseInteractiveButtons, type InteractivePayload } from "./send.js";
-import { getWristClawRuntime } from "./runtime.js";
+import { getWristClawRuntime, getRuntimeEnv } from "./runtime.js";
 import { monitorWristClawProvider } from "./monitor.js";
+import { CHANNEL_ID } from "./constants.js";
 
 /** channelData.wristclaw shape from OpenClaw core */
 type WristClawChannelData = {
@@ -28,10 +29,10 @@ type LineChannelData = {
 };
 
 export const wristclawPlugin: ChannelPlugin<ResolvedWristClawAccount> = {
-  id: "wristclaw",
+  id: CHANNEL_ID,
 
   meta: {
-    id: "wristclaw",
+    id: CHANNEL_ID,
     label: "WristClaw",
     selectionLabel: "WristClaw (API)",
     docsPath: "/channels/wristclaw",
@@ -90,7 +91,7 @@ export const wristclawPlugin: ChannelPlugin<ResolvedWristClawAccount> = {
           interactive: parsed.interactive,
           replyToMessageId,
         });
-        return { channel: "wristclaw", ...result };
+        return { channel: CHANNEL_ID, ...result };
       }
 
       const result = await sendMessageWristClaw(to, text, {
@@ -99,7 +100,7 @@ export const wristclawPlugin: ChannelPlugin<ResolvedWristClawAccount> = {
         replyToMessageId,
       });
 
-      return { channel: "wristclaw", ...result };
+      return { channel: CHANNEL_ID, ...result };
     },
 
     sendPayload: async ({ to, text: rawText, payload, cfg, accountId }) => {
@@ -154,7 +155,7 @@ export const wristclawPlugin: ChannelPlugin<ResolvedWristClawAccount> = {
           interactive,
           replyToMessageId,
         });
-        return { channel: "wristclaw", ...result };
+        return { channel: CHANNEL_ID, ...result };
       }
 
       // Fallback to text
@@ -163,7 +164,7 @@ export const wristclawPlugin: ChannelPlugin<ResolvedWristClawAccount> = {
         apiKey: account.apiKey,
         replyToMessageId,
       });
-      return { channel: "wristclaw", ...result };
+      return { channel: CHANNEL_ID, ...result };
     },
 
     sendMedia: async ({ to, text, mediaUrl, mediaLocalRoots, cfg, accountId }) => {
@@ -195,12 +196,12 @@ export const wristclawPlugin: ChannelPlugin<ResolvedWristClawAccount> = {
               contentType: "image",
               mediaKey: upload.mediaKey,
             });
-            return { channel: "wristclaw", ...result };
+            return { channel: CHANNEL_ID, ...result };
           }
           // Upload failed — log and fall through to text fallback
-          console.error(`[wristclaw] sendMedia upload failed: ${upload.error}`);
+          getRuntimeEnv().error(`[wristclaw] sendMedia upload failed: ${upload.error}`);
         } catch (err) {
-          console.error(`[wristclaw] sendMedia error: ${err}`);
+          getRuntimeEnv().error(`[wristclaw] sendMedia error: ${err}`);
         }
       }
 
@@ -214,7 +215,7 @@ export const wristclawPlugin: ChannelPlugin<ResolvedWristClawAccount> = {
         apiKey: account.apiKey,
       });
 
-      return { channel: "wristclaw", ...result };
+      return { channel: CHANNEL_ID, ...result };
     },
   },
 

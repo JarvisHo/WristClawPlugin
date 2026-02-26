@@ -4,13 +4,15 @@
  */
 
 import type { WristClawChannelConfig } from "./types.js";
+import { VIA_TAG } from "./constants.js";
+import { BoundedMap } from "./bounded-map.js";
 
 // ---------------------------------------------------------------------------
 // Echo prevention
 // ---------------------------------------------------------------------------
 
 export function isEcho(via: string | undefined, senderId: string, botUserId: string): boolean {
-  if (via === "openclaw") return true;
+  if (via === VIA_TAG) return true;
   if (botUserId && senderId === botUserId) return true;
   return false;
 }
@@ -20,19 +22,12 @@ export function isEcho(via: string | undefined, senderId: string, botUserId: str
 // ---------------------------------------------------------------------------
 
 const CROSS_ACCOUNT_DEDUP_CAP = 2000;
-const CROSS_ACCOUNT_TTL_MS = 300_000;
-const crossAccountProcessed = new Map<string, number>();
+const crossAccountProcessed = new BoundedMap<string, true>(CROSS_ACCOUNT_DEDUP_CAP);
 
 /** Returns true if this is the first claim (proceed). False = duplicate. */
 export function crossAccountDedup(msgId: string): boolean {
   if (crossAccountProcessed.has(msgId)) return false;
-  crossAccountProcessed.set(msgId, Date.now());
-  if (crossAccountProcessed.size > CROSS_ACCOUNT_DEDUP_CAP) {
-    const cutoff = Date.now() - CROSS_ACCOUNT_TTL_MS;
-    for (const [id, ts] of crossAccountProcessed) {
-      if (ts < cutoff) crossAccountProcessed.delete(id);
-    }
-  }
+  crossAccountProcessed.set(msgId, true);
   return true;
 }
 

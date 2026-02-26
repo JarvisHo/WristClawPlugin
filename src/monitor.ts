@@ -9,7 +9,7 @@ import {
   type HistoryEntry,
 } from "openclaw/plugin-sdk";
 import type { ResolvedWristClawAccount, WristClawPair, WristClawConversation } from "./types.js";
-import { getWristClawRuntime } from "./runtime.js";
+import { getWristClawRuntime, setRuntimeEnv } from "./runtime.js";
 import { sendMessageWristClaw, authHeaders } from "./send.js";
 import { fetchWithRetry } from "./fetch-utils.js";
 import { VoiceWaiter } from "./voice-waiter.js";
@@ -27,6 +27,7 @@ import {
   resolveMediaUrl,
   type APIMessage,
 } from "./policy.js";
+import { CHANNEL_ID, VIA_TAG, WS_CHANNEL_PREFIX, WS_USER_PREFIX, SESSION_KEY_PREFIX } from "./constants.js";
 
 type PluginRuntimeType = ReturnType<typeof getWristClawRuntime>;
 
@@ -304,9 +305,6 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
 
   // === Download image(s) to local storage for vision model ===
   let imageMediaPaths: string[] = [];
-  if (contentType === "image") {
-    runtime.log(`[wristclaw] image msg: mediaUrl=${mediaUrl}, rawMediaUrl=${nested?.media_url ?? raw.media_url}, raw keys=${Object.keys(raw ?? {})}, nested keys=${Object.keys(nested ?? {})}`);
-  }
   if (contentType === "image" && mediaUrl) {
     const allUrls = [mediaUrl, ...(ctx.extraMediaUrls ?? [])].filter(
       (u) => isSafeMediaUrl(u, account.serverUrl),
@@ -391,7 +389,7 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
 
   const baseRoute = core.channel.routing.resolveAgentRoute({
     cfg: config,
-    channel: "wristclaw",
+    channel: CHANNEL_ID,
     accountId: account.accountId,
     peer: { kind: "direct" as const, id: senderId },
   });
@@ -405,8 +403,8 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
   const route = {
     agentId,
     sessionKey: account.accountId === "default"
-      ? `agent:wristclaw:${isOwner ? "direct" : "group"}:ch:${channelId}`
-      : `agent:wristclaw:${account.accountId}:${isOwner ? "direct" : "group"}:ch:${channelId}`,
+      ? `${SESSION_KEY_PREFIX}:${isOwner ? "direct" : "group"}:ch:${channelId}`
+      : `${SESSION_KEY_PREFIX}:${account.accountId}:${isOwner ? "direct" : "group"}:ch:${channelId}`,
     accountId: account.accountId,
   };
 
@@ -468,13 +466,13 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
     ConversationLabel: fromLabel,
     SenderName: senderName || undefined,
     SenderId: senderId,
-    Provider: "wristclaw",
-    Surface: "wristclaw",
+    Provider: CHANNEL_ID,
+    Surface: CHANNEL_ID,
     MessageSid: raw.message_id ?? `${Date.now()}`,
     ReplyToId: replyTo?.message_id,
     ReplyToBody: replyQuoteText || undefined,
     ReplyToSender: replyTo?.author_id,
-    OriginatingChannel: "wristclaw" as const,
+    OriginatingChannel: CHANNEL_ID as const,
     OriginatingTo: `wristclaw:${channelId}`,
     // Image: pass local media path(s) for vision model (matches Telegram plugin pattern)
     ...(imageMediaPaths.length > 1
@@ -502,7 +500,7 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
   const { onModelSelected, ...prefixOptions } = createReplyPrefixOptions({
     cfg: config,
     agentId: route.agentId,
-    channel: "wristclaw",
+    channel: CHANNEL_ID,
     accountId: account.accountId,
   });
 
@@ -547,7 +545,7 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
 
           const chunkMode = core.channel.text.resolveChunkMode(
             config,
-            "wristclaw",
+            CHANNEL_ID,
             account.accountId,
           );
           const chunks = core.channel.text.chunkMarkdownTextWithMode(
@@ -605,8 +603,8 @@ function extractChannelId(
     return pairToChannel.get(pairId)!;
   }
   // From WS channel field: "channel:<channelId>"
-  if (event.channel?.startsWith("channel:")) {
-    return event.channel.slice(8);
+  if (event.channel?.startsWith(WS_CHANNEL_PREFIX)) {
+    return event.channel.slice(WS_CHANNEL_PREFIX.length);
   }
   return null;
 }
@@ -624,6 +622,7 @@ export async function monitorWristClawProvider(
   options: WristClawMonitorOptions,
 ): Promise<{ stop: () => void }> {
   const { account, config, runtime, abortSignal, statusSink } = options;
+  setRuntimeEnv(runtime);
   const core = getWristClawRuntime();
 
   let ws: WebSocket | null = null;
@@ -782,7 +781,7 @@ export async function monitorWristClawProvider(
           }
 
           // Subscribe to user channel for group:member_added + pair:created
-          safeSend(JSON.stringify({ type: "subscribe", channel: `user:${botUserId}` }));
+          safeSend(JSON.stringify({ type: "subscribe", channel: `${WS_USER_PREFIX}${botUserId}` }));
 
           // Fetch all conversations (pairs + groups) and subscribe
           const conversations = await fetchConversations(account);
@@ -800,7 +799,7 @@ export async function monitorWristClawProvider(
               subscribedChannels.add(conv.channel_id);
               safeSend(JSON.stringify({
                 type: "subscribe",
-                channel: `channel:${conv.channel_id}`,
+                channel: `${WS_CHANNEL_PREFIX}${conv.channel_id}`,
               }));
             }
           }
@@ -819,10 +818,10 @@ export async function monitorWristClawProvider(
               try {
                 const missed = await fetchMissedMessages(chId, lastId, account);
                 for (const m of missed) {
-                  if (m.payload?.via === "openclaw") continue;
+                  if (m.payload?.via === VIA_TAG) continue;
                   if (botUserId && m.author_id === botUserId) continue;
 
-                  const wsChannel = `channel:${chId}`;
+                  const wsChannel = `${WS_CHANNEL_PREFIX}${chId}`;
                   const synth = apiMessageToWSEvent(m, wsChannel);
                   const synthChId = extractChannelId(synth, pairToChannel);
                   if (!synthChId) continue;
@@ -913,7 +912,7 @@ export async function monitorWristClawProvider(
         const gName = msg.payload.group_name ?? "group";
         if (chId) {
           groupChannelIds.add(chId);
-          safeSend(JSON.stringify({ type: "subscribe", channel: `channel:${chId}` }));
+          safeSend(JSON.stringify({ type: "subscribe", channel: `${WS_CHANNEL_PREFIX}${chId}` }));
           runtime.log(`[wristclaw] joined group "${gName}" (channel:${chId})`);
         }
         return;
@@ -933,7 +932,7 @@ export async function monitorWristClawProvider(
                 pairToChannel.set(pair.pair_id, pair.channel_id);
                 safeSend(JSON.stringify({
                   type: "subscribe",
-                  channel: `channel:${pair.channel_id}`,
+                  channel: `${WS_CHANNEL_PREFIX}${pair.channel_id}`,
                 }));
                 runtime.log(`[wristclaw] subscribed new pair ${pair.pair_id} (channel:${pair.channel_id})`);
               }

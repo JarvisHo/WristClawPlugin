@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { BaseResult } from "./types.js";
 import { fetchWithRetry } from "./fetch-utils.js";
+import { VIA_TAG, CLIENT_REQUEST_PREFIX } from "./constants.js";
 
 /** Build Authorization header for WristClaw API */
 export function authHeaders(apiKey: string): Record<string, string> {
@@ -73,10 +74,10 @@ export async function sendMessageWristClaw(
   };
 
   const body: SendMessageBody = {
-    client_request_id: `openclaw-${randomUUID()}`,
+    client_request_id: `${CLIENT_REQUEST_PREFIX}-${randomUUID()}`,
     content_type: opts.contentType ?? "text",
     text,
-    via: opts.via ?? "openclaw",
+    via: opts.via ?? VIA_TAG,
     ...(opts.mediaKey && { media_key: opts.mediaKey }),
     ...(opts.durationSec != null && { duration_sec: opts.durationSec }),
     ...(opts.interactive && { interactive: opts.interactive }),
