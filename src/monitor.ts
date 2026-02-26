@@ -12,6 +12,9 @@ import type { ResolvedWristClawAccount, WristClawPair, WristClawConversation } f
 import { getWristClawRuntime } from "./runtime.js";
 import { sendMessageWristClaw, authHeaders } from "./send.js";
 import { fetchWithRetry } from "./fetch-utils.js";
+import { VoiceWaiter } from "./voice-waiter.js";
+import { MediaGroupBuffer, type MediaGroupEntry } from "./media-group.js";
+import { BoundedMap, BoundedSet } from "./bounded-map.js";
 
 type PluginRuntimeType = ReturnType<typeof getWristClawRuntime>;
 
@@ -700,116 +703,58 @@ export async function monitorWristClawProvider(
   // pair_id → channel_id mapping
   const pairToChannel = new Map<string, string>();
   // channel_id → last seen message_id (for reconnect catch-up)
-  const lastSeenMessageId = new Map<string, string>();
+  const lastSeenMessageId = new BoundedMap<string, string>(500);
   // message_id → author_id cache (for catch-up and dedup)
-  const messageAuthorMap = new Map<string, string>();
-  const processedMessageIds = new Set<string>();
+  const messageAuthorMap = new BoundedMap<string, string>(MESSAGE_AUTHOR_CAP);
+  const processedMessageIds = new BoundedSet<string>(DEDUP_CAP);
   // Group chat history: channel_id → recent messages (for @mention context)
   const groupHistories = new Map<string, HistoryEntry[]>();
   const historyLimit = account.config.historyLimit ?? DEFAULT_GROUP_HISTORY_LIMIT;
   let activeDispatches = 0;
 
   // --- Media group buffer: batch rapid image messages from same sender ---
-  const MEDIA_GROUP_DELAY_MS = 800;
   type WSMessageNewEvent = WSEvent & { type: "message:new" };
-  type MediaGroupEntry = {
-    event: WSMessageNewEvent;
-    channelId: string;
-    wsChannel: string;
-    extraMediaUrls: string[];
-    timer: ReturnType<typeof setTimeout>;
-  };
-  const mediaGroupBuffer = new Map<string, MediaGroupEntry>();
 
-  function flushMediaGroup(key: string) {
-    const entry = mediaGroupBuffer.get(key);
-    if (!entry) return;
-    mediaGroupBuffer.delete(key);
-
-    if (activeDispatches >= MAX_CONCURRENT) {
-      runtime.log(`[wristclaw] dropping media group: ${activeDispatches} dispatches active`);
-      return;
-    }
-    activeDispatches++;
-    processMessage({
-      event: entry.event, channelId: entry.channelId, wsChannel: entry.wsChannel, ws, botUserId, botDisplayName,
-      isGroupChannel: groupChannelIds.has(entry.channelId), account, config, core, runtime, statusSink,
-      rateLimitCheck: isRateLimited, dedupCheck: markProcessed, groupHistories, historyLimit,
-      extraMediaUrls: entry.extraMediaUrls.length > 0 ? entry.extraMediaUrls : undefined,
-      waitForTranscription,
-    })
-      .catch((err) => runtime.error(`[wristclaw] process error: ${String(err)}`))
-      .finally(() => { activeDispatches--; });
-  }
+  const mediaGroupBuffer = new MediaGroupBuffer<WSMessageNewEvent>(
+    (entry) => {
+      if (activeDispatches >= MAX_CONCURRENT) {
+        runtime.log(`[wristclaw] dropping media group: ${activeDispatches} dispatches active`);
+        return;
+      }
+      activeDispatches++;
+      processMessage({
+        event: entry.event, channelId: entry.channelId, wsChannel: entry.wsChannel, ws, botUserId, botDisplayName,
+        isGroupChannel: groupChannelIds.has(entry.channelId), account, config, core, runtime, statusSink,
+        rateLimitCheck: isRateLimited, dedupCheck: markProcessed, groupHistories, historyLimit,
+        extraMediaUrls: entry.extraMediaUrls.length > 0 ? entry.extraMediaUrls : undefined,
+        waitForTranscription,
+      })
+        .catch((err) => runtime.error(`[wristclaw] process error: ${String(err)}`))
+        .finally(() => { activeDispatches--; });
+    },
+    800, // delay ms
+  );
 
   function bufferOrFlushImage(msg: WSMessageNewEvent, channelId: string, wsChannel: string): boolean {
     const nested = msg.payload?.payload;
     const contentType = nested?.content_type ?? "text";
+    const senderId = msg.payload?.author_id ?? "";
+    const key = `${channelId}:${senderId}`;
+
     if (contentType !== "image") {
-      // Non-image message from same sender: flush any buffered group immediately
-      const senderId = msg.payload?.author_id ?? "";
-      const key = `${channelId}:${senderId}`;
-      if (mediaGroupBuffer.has(key)) {
-        clearTimeout(mediaGroupBuffer.get(key)!.timer);
-        flushMediaGroup(key);
-      }
-      return false; // not buffered, let caller handle normally
+      return mediaGroupBuffer.tryBuffer(key, msg, channelId, wsChannel, undefined, false);
     }
 
-    const senderId = msg.payload?.author_id ?? "";
     const rawUrl = nested?.media_url ?? msg.payload?.media_url;
     const mediaUrl = rawUrl && rawUrl.startsWith("/")
       ? `${account.config.baseUrl ?? account.config.serverUrl ?? ""}${rawUrl}`
       : rawUrl;
-    const key = `${channelId}:${senderId}`;
 
-    const existing = mediaGroupBuffer.get(key);
-    if (existing) {
-      // Add to existing group
-      clearTimeout(existing.timer);
-      if (mediaUrl) existing.extraMediaUrls.push(mediaUrl);
-      existing.timer = setTimeout(() => flushMediaGroup(key), MEDIA_GROUP_DELAY_MS);
-    } else {
-      // Start new group — first image becomes the "primary" event
-      const timer = setTimeout(() => flushMediaGroup(key), MEDIA_GROUP_DELAY_MS);
-      mediaGroupBuffer.set(key, {
-        event: msg,
-        channelId,
-        wsChannel,
-        extraMediaUrls: [],
-        timer,
-      });
-    }
-    return true; // buffered
+    return mediaGroupBuffer.tryBuffer(key, msg, channelId, wsChannel, mediaUrl, true);
   }
-  // --- Voice transcription waiter: wait for message:update before dispatching ---
-  const VOICE_WAIT_MS = 15_000;
-  type VoiceWaiter = {
-    resolve: (text: string) => void;
-    timer: ReturnType<typeof setTimeout>;
-  };
-  const voiceWaiters = new Map<string, VoiceWaiter>();
-
-  /** Wait for transcription text via message:update. Returns text or empty string on timeout. */
-  function waitForTranscription(messageId: string): Promise<string> {
-    return new Promise<string>((resolve) => {
-      const timer = setTimeout(() => {
-        voiceWaiters.delete(messageId);
-        resolve(""); // timeout — no transcription
-      }, VOICE_WAIT_MS);
-      voiceWaiters.set(messageId, { resolve, timer });
-    });
-  }
-
-  /** Called when message:update arrives — resolves the waiter if any. */
-  function resolveVoiceWaiter(messageId: string, text: string): boolean {
-    const waiter = voiceWaiters.get(messageId);
-    if (!waiter) return false;
-    clearTimeout(waiter.timer);
-    voiceWaiters.delete(messageId);
-    waiter.resolve(text);
-    return true;
-  }
+  // --- Voice transcription waiter ---
+  const voiceWaiter = new VoiceWaiter();
+  const waitForTranscription = (messageId: string) => voiceWaiter.wait(messageId);
 
   const senderTimestamps = new Map<string, number[]>();
 
@@ -839,17 +784,7 @@ export async function monitorWristClawProvider(
   }, RATE_LIMIT_CLEANUP_MS);
 
   function markProcessed(msgId: string): boolean {
-    if (processedMessageIds.has(msgId)) return false; // already processed
-    processedMessageIds.add(msgId);
-    if (processedMessageIds.size > DEDUP_CAP) {
-      // Evict oldest ~20%
-      const iter = processedMessageIds.values();
-      for (let i = 0; i < DEDUP_CAP * 0.2; i++) {
-        const v = iter.next().value;
-        if (v) processedMessageIds.delete(v);
-      }
-    }
-    return true; // first time
+    return processedMessageIds.add(msgId); // true = new, false = duplicate
   }
 
   let botUserId = "";
@@ -1027,11 +962,6 @@ export async function monitorWristClawProvider(
         }
         if (msgId && authorId) {
           messageAuthorMap.set(msgId, authorId);
-          if (messageAuthorMap.size > MESSAGE_AUTHOR_CAP) {
-            // Evict oldest entry
-            const firstKey = messageAuthorMap.keys().next().value;
-            if (firstKey) messageAuthorMap.delete(firstKey);
-          }
         }
 
         statusSink?.({ lastInboundAt: Date.now() });
@@ -1057,7 +987,7 @@ export async function monitorWristClawProvider(
         const msgId = uPayload?.message_id ?? "";
         const uText = uPayload?.text ?? "";
         if (msgId && uText) {
-          if (resolveVoiceWaiter(msgId, uText)) {
+          if (voiceWaiter.resolve(msgId, uText)) {
             runtime.log(`[wristclaw] message:update resolved voice waiter for ${msgId}`);
           }
         }
@@ -1124,17 +1054,8 @@ export async function monitorWristClawProvider(
   const stop = () => {
     stopped = true;
     clearInterval(rateLimitCleanup);
-    // Flush pending media groups on shutdown
-    for (const [key, entry] of mediaGroupBuffer) {
-      clearTimeout(entry.timer);
-      flushMediaGroup(key);
-    }
-    // Cancel pending voice waiters
-    for (const [id, waiter] of voiceWaiters) {
-      clearTimeout(waiter.timer);
-      waiter.resolve("");
-    }
-    voiceWaiters.clear();
+    mediaGroupBuffer.dispose();
+    voiceWaiter.dispose();
     if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
     if (pongTimeout) { clearTimeout(pongTimeout); pongTimeout = null; }
     if (reconnectTimer) {
