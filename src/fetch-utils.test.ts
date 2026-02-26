@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { createServer } from "node:http";
-import { fetchWithTimeout, fetchWithRetry } from "./fetch-utils.js";
+import { fetchWithTimeout, fetchWithRetry, isTransientError } from "./fetch-utils.js";
 
 function startMockServer(
   handler: () => Response | Promise<Response>,
@@ -153,5 +153,55 @@ describe("fetchWithRetry", () => {
       expect(err).toBeInstanceOf(TypeError);
     }
     expect(threw).toBe(true);
+  });
+});
+
+describe("isTransientError", () => {
+  it("true for AbortError", () => {
+    expect(isTransientError(new DOMException("aborted", "AbortError"))).toBe(true);
+  });
+
+  it("true for fetch network TypeError", () => {
+    expect(isTransientError(new TypeError("fetch failed"))).toBe(true);
+  });
+
+  it("true for ECONNREFUSED", () => {
+    expect(isTransientError(new TypeError("ECONNREFUSED"))).toBe(true);
+  });
+
+  it("true for ETIMEDOUT", () => {
+    expect(isTransientError(new TypeError("connect ETIMEDOUT 1.2.3.4:443"))).toBe(true);
+  });
+
+  it("true for ENOTFOUND", () => {
+    expect(isTransientError(new TypeError("getaddrinfo ENOTFOUND example.com"))).toBe(true);
+  });
+
+  it("true for socket error", () => {
+    expect(isTransientError(new TypeError("socket hang up"))).toBe(true);
+  });
+
+  it("true for network error", () => {
+    expect(isTransientError(new TypeError("NetworkError when attempting to fetch resource"))).toBe(true);
+  });
+
+  it("false for programming bug TypeError", () => {
+    expect(isTransientError(new TypeError("Cannot read properties of undefined (reading 'foo')"))).toBe(false);
+  });
+
+  it("false for type coercion TypeError", () => {
+    expect(isTransientError(new TypeError("null is not an object"))).toBe(false);
+  });
+
+  it("false for non-TypeError non-DOMException", () => {
+    expect(isTransientError(new Error("some error"))).toBe(false);
+  });
+
+  it("false for string error", () => {
+    expect(isTransientError("oops")).toBe(false);
+  });
+
+  it("false for null", () => {
+    expect(isTransientError(null)).toBe(false);
   });
 });

@@ -84,7 +84,7 @@ export async function fetchWithRetry(
   throw lastError;
 }
 
-function isTransientError(err: unknown): boolean {
+export function isTransientError(err: unknown): boolean {
   if (err instanceof DOMException && err.name === "AbortError") return true;
   // fetch() throws TypeError for network errors — but so do real bugs.
   // Only retry if the message looks like a network/fetch error.
