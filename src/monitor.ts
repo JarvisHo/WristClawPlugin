@@ -15,6 +15,18 @@ import { fetchWithRetry } from "./fetch-utils.js";
 import { VoiceWaiter } from "./voice-waiter.js";
 import { MediaGroupBuffer, type MediaGroupEntry } from "./media-group.js";
 import { BoundedMap, BoundedSet } from "./bounded-map.js";
+import {
+  isEcho,
+  crossAccountDedup,
+  isSafeMediaUrl,
+  checkDmPolicy,
+  checkGroupPolicy,
+  detectAndStripMention,
+  SenderRateLimiter,
+  apiMessageToWSPayload,
+  resolveMediaUrl,
+  type APIMessage,
+} from "./policy.js";
 
 type PluginRuntimeType = ReturnType<typeof getWristClawRuntime>;
 
@@ -111,23 +123,7 @@ const RATE_LIMIT_MAX = 10;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 /** Rate limit map cleanup interval (ms) */
 const RATE_LIMIT_CLEANUP_MS = 300_000;
-/** Cross-account dedup: shared across all account monitors to prevent
- *  duplicate AI dispatch when multiple accounts see the same channel. */
-const CROSS_ACCOUNT_DEDUP_CAP = 2000;
-const crossAccountProcessed = new Map<string, number>(); // messageId → timestamp
-
-function crossAccountDedup(msgId: string): boolean {
-  if (crossAccountProcessed.has(msgId)) return false; // already claimed
-  crossAccountProcessed.set(msgId, Date.now());
-  // Evict old entries
-  if (crossAccountProcessed.size > CROSS_ACCOUNT_DEDUP_CAP) {
-    const cutoff = Date.now() - 300_000; // 5 min
-    for (const [id, ts] of crossAccountProcessed) {
-      if (ts < cutoff) crossAccountProcessed.delete(id);
-    }
-  }
-  return true; // first claim
-}
+// crossAccountDedup imported from policy.ts
 
 /** WS keepalive ping interval (ms) */
 const PING_INTERVAL_MS = 30_000;
@@ -184,15 +180,7 @@ async function fetchConversations(account: ResolvedWristClawAccount): Promise<Wr
 // Catch-up: fetch missed messages after reconnect
 // ---------------------------------------------------------------------------
 
-type APIMessage = {
-  message_id: string;
-  author_id: string;
-  channel_id: string;
-  payload?: { content_type?: string; text?: string; media_url?: string; duration_sec?: number; via?: string };
-  media_url?: string;
-  created_at: string;
-  reply_context?: { message_id?: string; author_id?: string; text_preview?: string };
-};
+// APIMessage imported from policy.ts
 
 async function fetchMissedMessages(
   channelId: string,
@@ -216,20 +204,7 @@ function apiMessageToWSEvent(msg: APIMessage, wsChannel: string): WSEvent & { ty
   return {
     type: "message:new" as const,
     channel: wsChannel,
-    payload: {
-      message_id: msg.message_id,
-      channel_id: msg.channel_id,
-      author_id: msg.author_id,
-      media_url: msg.media_url,
-      created_at: msg.created_at,
-      payload: {
-        content_type: msg.payload?.content_type,
-        text: msg.payload?.text,
-        media_url: msg.payload?.media_url,
-        duration_sec: msg.payload?.duration_sec,
-        via: msg.payload?.via,
-      },
-    },
+    payload: apiMessageToWSPayload(msg),
   };
 }
 
@@ -260,20 +235,7 @@ type ProcessMessageCtx = {
   waitForTranscription?: (messageId: string) => Promise<string>;
 };
 
-/** Validate that a media URL is safe to fetch (same origin as server, or relative) */
-function isSafeMediaUrl(url: string, serverUrl: string): boolean {
-  if (!url) return false;
-  // Relative paths are always safe (resolved to server origin)
-  if (url.startsWith("/")) return true;
-  try {
-    const parsed = new URL(url);
-    const server = new URL(serverUrl);
-    // Only allow same hostname as the configured server
-    return parsed.hostname === server.hostname;
-  } catch {
-    return false;
-  }
-}
+// isSafeMediaUrl imported from policy.ts
 
 async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
   const { event, channelId, wsChannel, ws, botUserId, botDisplayName, isGroupChannel, account, config, core, runtime, statusSink, rateLimitCheck, dedupCheck } = ctx;
@@ -285,17 +247,13 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
   const contentType = nested?.content_type ?? "text";
   const text = nested?.text;
   const rawMediaUrl = nested?.media_url ?? raw.media_url;
-  // Resolve relative media URLs (server may return /media/... paths)
-  const mediaUrl = rawMediaUrl && rawMediaUrl.startsWith("/")
-    ? `${account.config.baseUrl ?? account.config.serverUrl ?? ""}${rawMediaUrl}`
-    : rawMediaUrl;
+  const mediaUrl = resolveMediaUrl(rawMediaUrl, account.serverUrl);
   const senderId = raw.author_id ?? "";
   // WS broadcast now includes sender_name (resolved by OutboxProcessor)
   const senderName = raw.sender_name ?? "";
 
   // === Echo prevention (double check: via field + sender_id) ===
-  if (via === "openclaw") return;
-  if (botUserId && senderId === botUserId) return;
+  if (isEcho(via, senderId, botUserId)) return;
 
   // === Cross-account dedup (prevents double reply when multiple accounts see same channel) ===
   const msgId = raw.message_id;
@@ -304,32 +262,15 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
   // === Per-account dedup check (WS reconnect catch-up overlap) ===
   if (msgId && dedupCheck && !dedupCheck(msgId)) return;
 
-  // === Access policy gate (DM vs Group, modeled after Telegram plugin) ===
+  // === Access policy gate (DM vs Group) ===
   const isOwnerSender = Boolean(account.ownerUserId && senderId === account.ownerUserId);
 
   if (ctx.isGroupChannel) {
-    // --- Group policy ---
-    const groupPolicy = account.config.groupPolicy ?? "mention";
-    if (groupPolicy === "disabled") return;
-
-    // Group allowFrom: optional per-group sender filter
-    const groupAllowFrom = account.config.groupAllowFrom;
-    if (groupAllowFrom?.length) {
-      const isWildcard = groupAllowFrom.some((id) => String(id).trim() === "*");
-      if (!isWildcard && !isOwnerSender) {
-        if (!groupAllowFrom.some((id) => String(id) === senderId)) return;
-      }
-    }
+    const groupResult = checkGroupPolicy(account.config, senderId, isOwnerSender);
+    if (groupResult === "deny") return;
   } else {
-    // --- DM policy ---
-    const dmPolicy = account.config.dmPolicy ?? "open";
-    if (dmPolicy === "disabled" && !isOwnerSender) return;
-    if (dmPolicy === "allowlist" && !isOwnerSender) {
-      const allowFrom = account.config.allowFrom;
-      if (!allowFrom?.length) return; // no allowlist entries = block all
-      const isWildcard = allowFrom.some((id) => String(id).trim() === "*");
-      if (!isWildcard && !allowFrom.some((id) => String(id) === senderId)) return;
-    }
+    const dmResult = checkDmPolicy(account.config, senderId, isOwnerSender);
+    if (dmResult === "deny") return;
   }
 
   // === Per-sender rate limit (injected via closure) ===
@@ -401,23 +342,20 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
     const senderLabel = senderName || `user:${senderId.slice(0, 8)}`;
 
     if (groupPolicy === "mention") {
-      // Resolve mention names for @mention detection
+      // Resolve mention names
       const mentionNames: string[] = [];
       const cfgMention = account.config.mentionNames;
       if (Array.isArray(cfgMention)) {
-        for (const n of cfgMention) if (typeof n === "string" && n) mentionNames.push(n.toLowerCase());
+        for (const n of cfgMention) if (typeof n === "string" && n) mentionNames.push(n);
       }
-      if (ctx.botDisplayName) {
-        const bn = ctx.botDisplayName.toLowerCase();
-        if (!mentionNames.includes(bn)) mentionNames.push(bn);
+      if (ctx.botDisplayName && !mentionNames.some(n => n.toLowerCase() === ctx.botDisplayName.toLowerCase())) {
+        mentionNames.push(ctx.botDisplayName);
       }
       mentionNames.push("all");
 
-      const rawText = rawBody.toLowerCase();
-      const isMentioned = mentionNames.some(name => rawText.includes(`@${name}`));
+      const { mentioned, stripped } = detectAndStripMention(rawBody, mentionNames);
 
-      if (!isMentioned) {
-        // Not mentioned → record to history and return (don't dispatch to AI)
+      if (!mentioned) {
         recordPendingHistoryEntryIfEnabled({
           historyMap: groupHistories,
           historyKey,
@@ -432,11 +370,7 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
         return;
       }
 
-      // Mentioned → strip @mention from rawBody
-      for (const name of mentionNames) {
-        rawBody = rawBody.replace(new RegExp(`@${name}\\s*`, "gi"), "");
-      }
-      rawBody = rawBody.trim();
+      rawBody = stripped;
       if (!rawBody) return;
     }
     // groupPolicy="open": fall through (no mention check, no history needed)
@@ -756,32 +690,11 @@ export async function monitorWristClawProvider(
   const voiceWaiter = new VoiceWaiter();
   const waitForTranscription = (messageId: string) => voiceWaiter.wait(messageId);
 
-  const senderTimestamps = new Map<string, number[]>();
-
-  function isRateLimited(senderId: string): boolean {
-    const now = Date.now();
-    let timestamps = senderTimestamps.get(senderId);
-    if (!timestamps) {
-      timestamps = [];
-      senderTimestamps.set(senderId, timestamps);
-    }
-    // Evict old entries
-    timestamps = timestamps.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
-    senderTimestamps.set(senderId, timestamps);
-    if (timestamps.length >= RATE_LIMIT_MAX) return true;
-    timestamps.push(now);
-    return false;
-  }
+  const rateLimiter = new SenderRateLimiter(RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS);
+  const isRateLimited = (senderId: string) => rateLimiter.isLimited(senderId);
 
   // Periodic cleanup of stale sender entries (every 5 min)
-  const rateLimitCleanup = setInterval(() => {
-    const now = Date.now();
-    for (const [id, ts] of senderTimestamps) {
-      const fresh = ts.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
-      if (fresh.length === 0) senderTimestamps.delete(id);
-      else senderTimestamps.set(id, fresh);
-    }
-  }, RATE_LIMIT_CLEANUP_MS);
+  const rateLimitCleanup = setInterval(() => rateLimiter.cleanup(), RATE_LIMIT_CLEANUP_MS);
 
   function markProcessed(msgId: string): boolean {
     return processedMessageIds.add(msgId); // true = new, false = duplicate
