@@ -141,4 +141,17 @@ describe("fetchWithRetry", () => {
       srv.close();
     }
   });
+
+  it("does not retry on non-network TypeError (e.g. bug)", async () => {
+    // fetchWithRetry to a completely invalid URL scheme → TypeError
+    // With the narrowed check, non-fetch TypeErrors should NOT be retried
+    let threw = false;
+    try {
+      await fetchWithRetry("not-a-valid-url://broken", { retries: 2, timeoutMs: 2000 });
+    } catch (err) {
+      threw = true;
+      expect(err).toBeInstanceOf(TypeError);
+    }
+    expect(threw).toBe(true);
+  });
 });

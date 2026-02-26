@@ -86,7 +86,13 @@ export async function fetchWithRetry(
 
 function isTransientError(err: unknown): boolean {
   if (err instanceof DOMException && err.name === "AbortError") return true;
-  if (err instanceof TypeError) return true; // fetch network errors
+  // fetch() throws TypeError for network errors — but so do real bugs.
+  // Only retry if the message looks like a network/fetch error.
+  if (err instanceof TypeError) {
+    const msg = err.message.toLowerCase();
+    return msg.includes("fetch") || msg.includes("network") || msg.includes("econnr")
+      || msg.includes("etimedout") || msg.includes("enotfound") || msg.includes("socket");
+  }
   return false;
 }
 

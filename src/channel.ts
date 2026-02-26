@@ -197,15 +197,17 @@ export const wristclawPlugin: ChannelPlugin<ResolvedWristClawAccount> = {
             });
             return { channel: "wristclaw", ...result };
           }
+          // Upload failed — log and fall through to text fallback
+          console.error(`[wristclaw] sendMedia upload failed: ${upload.error}`);
         } catch (err) {
           console.error(`[wristclaw] sendMedia error: ${err}`);
         }
       }
 
-      // Fallback: send as text with link
+      // Fallback: send as text with link (image upload failed)
       const fallbackText = text
-        ? `${text}\n\n📎 ${mediaUrl ?? "(media)"}`
-        : `📎 ${mediaUrl ?? "(media)"}`;
+        ? `${text}\n\n⚠️ 圖片傳送失敗\n📎 ${mediaUrl ?? "(media)"}`
+        : `⚠️ 圖片傳送失敗\n📎 ${mediaUrl ?? "(media)"}`;
 
       const result = await sendMessageWristClaw(to, fallbackText, {
         serverUrl: account.serverUrl,
