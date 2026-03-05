@@ -27,7 +27,7 @@ import {
   resolveMediaUrl,
   type APIMessage,
 } from "./policy.js";
-import { CHANNEL_ID, VIA_TAG, WS_CHANNEL_PREFIX, WS_USER_PREFIX, SESSION_KEY_PREFIX } from "./constants.js";
+import { CHANNEL_ID, VIA_TAG, WS_CHANNEL_PREFIX, WS_USER_PREFIX } from "./constants.js";
 
 type PluginRuntimeType = ReturnType<typeof getWristClawRuntime>;
 
@@ -60,7 +60,10 @@ type WSReplyTo = {
   quote_text?: string;
 };
 
-/** message:new payload from OutboxProcessor */
+/** message:new payload from OutboxProcessor.
+ *  Live WS broadcasts use nested format (content fields inside `payload`).
+ *  Catch-up messages from apiMessageToWSPayload use flat format.
+ *  Both are supported — flat fields take priority over nested. */
 type WSMessagePayload = {
   pair_id?: string;
   author_id?: string;
@@ -70,6 +73,13 @@ type WSMessagePayload = {
   created_at?: string;
   media_url?: string;
   reply_to?: WSReplyTo;
+  client_request_id?: string;
+  // Flat fields (catch-up / new outbox format)
+  content_type?: string;
+  text?: string;
+  via?: string;
+  duration_sec?: number;
+  // Nested payload (live WS broadcast)
   payload?: WSMessageContent;
 };
 
@@ -243,11 +253,12 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
   const raw = event.payload;
   if (!raw) return;
 
+  // Support both flat (new outbox_processor) and nested (legacy) payload structure
   const nested = raw.payload;
-  const via = nested?.via;
-  const contentType = nested?.content_type ?? "text";
-  const text = nested?.text;
-  const rawMediaUrl = nested?.media_url ?? raw.media_url;
+  const via = raw.via ?? nested?.via;
+  const contentType = raw.content_type ?? nested?.content_type ?? "text";
+  const text = raw.text ?? nested?.text;
+  const rawMediaUrl = raw.media_url ?? nested?.media_url;
   const mediaUrl = resolveMediaUrl(rawMediaUrl, account.serverUrl);
   const senderId = raw.author_id ?? "";
   // WS broadcast now includes sender_name (resolved by OutboxProcessor)
@@ -398,13 +409,14 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
     ? baseRoute.agentId
     : (account.config.secretaryAgentId ?? baseRoute.agentId);
 
-  // All WristClaw users get per-channel sessions (owner included)
-  // Session key uses fixed "wristclaw" prefix (not agentId) for stable keys across routing changes
+  // Use core-generated sessionKey (agent:{agentId}:{channel}:...) for correct workspace resolution.
+  // For secretary (non-owner), swap the agentId prefix so it routes to the secretary workspace.
+  const baseSessionKey = baseRoute.sessionKey;
   const route = {
     agentId,
-    sessionKey: account.accountId === "default"
-      ? `${SESSION_KEY_PREFIX}:${isOwner ? "direct" : "group"}:ch:${channelId}`
-      : `${SESSION_KEY_PREFIX}:${account.accountId}:${isOwner ? "direct" : "group"}:ch:${channelId}`,
+    sessionKey: agentId === baseRoute.agentId
+      ? baseSessionKey
+      : baseSessionKey.replace(`agent:${baseRoute.agentId}:`, `agent:${agentId}:`),
     accountId: account.accountId,
   };
 
@@ -669,16 +681,18 @@ export async function monitorWristClawProvider(
   );
 
   function bufferOrFlushImage(msg: WSMessageNewEvent, channelId: string, wsChannel: string): boolean {
-    const nested = msg.payload?.payload;
-    const contentType = nested?.content_type ?? "text";
-    const senderId = msg.payload?.author_id ?? "";
+    // Support both flat (new outbox_processor) and nested (legacy) payload structure
+    const raw = msg.payload;
+    const nested = raw?.payload;
+    const contentType = raw?.content_type ?? nested?.content_type ?? "text";
+    const senderId = raw?.author_id ?? "";
     const key = `${channelId}:${senderId}`;
 
     if (contentType !== "image") {
       return mediaGroupBuffer.tryBuffer(key, msg, channelId, wsChannel, undefined, false);
     }
 
-    const rawUrl = nested?.media_url ?? msg.payload?.media_url;
+    const rawUrl = raw?.media_url ?? nested?.media_url;
     const mediaUrl = rawUrl && rawUrl.startsWith("/")
       ? `${account.config.baseUrl ?? account.config.serverUrl ?? ""}${rawUrl}`
       : rawUrl;

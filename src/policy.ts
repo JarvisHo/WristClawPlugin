@@ -177,19 +177,22 @@ type APIMessage = {
 };
 
 export function apiMessageToWSPayload(msg: APIMessage) {
+  // Flat structure (matches WSMessagePayload flat fields)
   return {
     message_id: msg.message_id,
     channel_id: msg.channel_id,
     author_id: msg.author_id,
-    media_url: msg.media_url,
+    media_url: msg.payload?.media_url ?? msg.media_url,
     created_at: msg.created_at,
-    payload: {
-      content_type: msg.payload?.content_type,
-      text: msg.payload?.text,
-      media_url: msg.payload?.media_url,
-      duration_sec: msg.payload?.duration_sec,
-      via: msg.payload?.via,
-    },
+    content_type: msg.payload?.content_type,
+    text: msg.payload?.text,
+    duration_sec: msg.payload?.duration_sec,
+    via: msg.payload?.via,
+    reply_to: msg.reply_context ? {
+      message_id: msg.reply_context.message_id,
+      author_id: msg.reply_context.author_id,
+      text_preview: msg.reply_context.text_preview,
+    } : undefined,
   };
 }
 

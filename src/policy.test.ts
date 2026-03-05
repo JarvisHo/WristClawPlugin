@@ -216,8 +216,8 @@ describe("apiMessageToWSPayload", () => {
     });
     expect(result.message_id).toBe("123");
     expect(result.channel_id).toBe("ch1");
-    expect(result.payload?.text).toBe("hello");
-    expect(result.payload?.via).toBe("app");
+    expect(result.text).toBe("hello");
+    expect(result.via).toBe("app");
     expect(result.media_url).toBe("https://cdn/img.jpg");
   });
   it("handles missing payload fields", () => {
@@ -227,8 +227,37 @@ describe("apiMessageToWSPayload", () => {
       channel_id: "c",
       created_at: "2026-01-01T00:00:00Z",
     });
-    expect(result.payload?.content_type).toBeUndefined();
+    expect(result.content_type).toBeUndefined();
     expect(result.media_url).toBeUndefined();
+    expect(result.reply_to).toBeUndefined();
+  });
+  it("maps reply_context to reply_to", () => {
+    const result = apiMessageToWSPayload({
+      message_id: "789",
+      author_id: "user1",
+      channel_id: "ch1",
+      created_at: "2026-03-01T00:00:00Z",
+      reply_context: {
+        message_id: "orig-100",
+        author_id: "user2",
+        text_preview: "original text",
+      },
+    });
+    expect(result.reply_to).toEqual({
+      message_id: "orig-100",
+      author_id: "user2",
+      text_preview: "original text",
+    });
+  });
+  it("returns undefined reply_to when no reply_context", () => {
+    const result = apiMessageToWSPayload({
+      message_id: "800",
+      author_id: "user1",
+      channel_id: "ch1",
+      created_at: "2026-03-01T00:00:00Z",
+      payload: { content_type: "text", text: "no reply" },
+    });
+    expect(result.reply_to).toBeUndefined();
   });
 });
 

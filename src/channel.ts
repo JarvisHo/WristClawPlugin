@@ -5,6 +5,7 @@ import { resolveWristClawAccount, listWristClawAccountIds } from "./config.js";
 import { sendMessageWristClaw, uploadMediaWristClaw, probeWristClaw, parseInteractiveButtons, type InteractivePayload } from "./send.js";
 import { getWristClawRuntime, getRuntimeEnv } from "./runtime.js";
 import { monitorWristClawProvider } from "./monitor.js";
+import { createAgentTools } from "./tools.js";
 import { CHANNEL_ID } from "./constants.js";
 
 /** channelData.wristclaw shape from OpenClaw core */
@@ -265,4 +266,6 @@ export const wristclawPlugin: ChannelPlugin<ResolvedWristClawAccount> = {
       hint: "<channelId>",
     },
   },
+
+  agentTools: (params) => createAgentTools(params.cfg ?? {}),
 };
