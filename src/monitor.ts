@@ -43,15 +43,6 @@ export type WristClawMonitorOptions = {
 // WS event types (discriminated union)
 // ---------------------------------------------------------------------------
 
-/** Nested message content inside WS broadcast */
-type WSMessageContent = {
-  content_type?: string;
-  text?: string;
-  media_url?: string;
-  duration_sec?: number;
-  via?: string;
-};
-
 /** Reply context included in message:new broadcast */
 type WSReplyTo = {
   message_id?: string;
@@ -60,10 +51,7 @@ type WSReplyTo = {
   quote_text?: string;
 };
 
-/** message:new payload from OutboxProcessor.
- *  Live WS broadcasts use nested format (content fields inside `payload`).
- *  Catch-up messages from apiMessageToWSPayload use flat format.
- *  Both are supported — flat fields take priority over nested. */
+/** message:new payload — flat format from OutboxProcessor and catch-up. */
 type WSMessagePayload = {
   pair_id?: string;
   author_id?: string;
@@ -74,13 +62,10 @@ type WSMessagePayload = {
   media_url?: string;
   reply_to?: WSReplyTo;
   client_request_id?: string;
-  // Flat fields (catch-up / new outbox format)
   content_type?: string;
   text?: string;
   via?: string;
   duration_sec?: number;
-  // Nested payload (live WS broadcast)
-  payload?: WSMessageContent;
 };
 
 /** voice:transcribed payload (legacy, kept for WSEvent union compat) */
@@ -253,12 +238,10 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
   const raw = event.payload;
   if (!raw) return;
 
-  // Support both flat (new outbox_processor) and nested (legacy) payload structure
-  const nested = raw.payload;
-  const via = raw.via ?? nested?.via;
-  const contentType = raw.content_type ?? nested?.content_type ?? "text";
-  const text = raw.text ?? nested?.text;
-  const rawMediaUrl = raw.media_url ?? nested?.media_url;
+  const via = raw.via;
+  const contentType = raw.content_type ?? "text";
+  const text = raw.text;
+  const rawMediaUrl = raw.media_url;
   const mediaUrl = resolveMediaUrl(rawMediaUrl, account.serverUrl);
   const senderId = raw.author_id ?? "";
   // WS broadcast now includes sender_name (resolved by OutboxProcessor)
@@ -681,10 +664,8 @@ export async function monitorWristClawProvider(
   );
 
   function bufferOrFlushImage(msg: WSMessageNewEvent, channelId: string, wsChannel: string): boolean {
-    // Support both flat (new outbox_processor) and nested (legacy) payload structure
     const raw = msg.payload;
-    const nested = raw?.payload;
-    const contentType = raw?.content_type ?? nested?.content_type ?? "text";
+    const contentType = raw?.content_type ?? "text";
     const senderId = raw?.author_id ?? "";
     const key = `${channelId}:${senderId}`;
 
@@ -692,7 +673,7 @@ export async function monitorWristClawProvider(
       return mediaGroupBuffer.tryBuffer(key, msg, channelId, wsChannel, undefined, false);
     }
 
-    const rawUrl = raw?.media_url ?? nested?.media_url;
+    const rawUrl = raw?.media_url;
     const mediaUrl = rawUrl && rawUrl.startsWith("/")
       ? `${account.config.baseUrl ?? account.config.serverUrl ?? ""}${rawUrl}`
       : rawUrl;
