@@ -71,9 +71,10 @@ export async function handleTaskEvent(
     event.claimed_by_agent === botUserId;
   if (!isAssignedToMe) return;
 
-  // Dedup
-  if (!event.task_id || processedTasks.has(event.task_id)) return;
-  processedTasks.add(event.task_id);
+  // Dedup — key includes status so re-assignments (e.g. reopened task) are processed
+  const dedupKey = `${event.task_id}:${event.status || "unknown"}`;
+  if (!event.task_id || processedTasks.has(dedupKey)) return;
+  processedTasks.add(dedupKey);
 
   // Concurrency guard
   if (activeCount >= MAX_CONCURRENT) {
@@ -147,14 +148,18 @@ async function processTask(
     }
   }
 
-  // Dispatch to AI agent
-  const route = core.channel.route.resolveAgentRoute({
+  // Dispatch to AI agent — use same routing pattern as monitor.ts
+  const baseRoute = core.channel.routing.resolveAgentRoute({
     cfg: config,
     channel: CHANNEL_ID,
     accountId: account.accountId,
-    senderId: "system",
-    isOwner: true,
+    peer: { kind: "direct" as const, id: "system" },
   });
+  const route = {
+    agentId: baseRoute.agentId,
+    sessionKey: baseRoute.sessionKey,
+    accountId: account.accountId,
+  };
 
   const ctxPayload = core.channel.reply.finalizeInboundContext({
     Body: instruction,
