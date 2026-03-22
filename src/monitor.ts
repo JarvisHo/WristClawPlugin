@@ -28,6 +28,7 @@ import {
   type APIMessage,
 } from "./policy.js";
 import { CHANNEL_ID, VIA_TAG, WS_CHANNEL_PREFIX, WS_USER_PREFIX } from "./constants.js";
+import { handleTaskEvent } from "./task-processor.js";
 
 type PluginRuntimeType = ReturnType<typeof getWristClawRuntime>;
 
@@ -973,16 +974,24 @@ export async function monitorWristClawProvider(
         return;
       }
 
-      // ── Task events → log for agent awareness ──
+      // ── Task events → log + auto-process ──
       if (msg.type === "task:created" || msg.type === "task:updated" || msg.type === "task:claimed") {
         const p = msg.payload;
         if (p?.task_id) {
           runtime.log(`[wristclaw] ${msg.type}: "${p.title || p.task_id}" (status: ${p.status || "?"}, org: ${p.org_id || "?"})`);
 
-          // If task was assigned to this agent, subscribe to its channel for messages
+          // Subscribe to task channel if assigned to this agent
           if (p.channel_id && (p.assignee_agent_id === botUserId || p.claimed_by_agent === botUserId)) {
             safeSend(JSON.stringify({ type: "subscribe", channel: `${WS_CHANNEL_PREFIX}${p.channel_id}` }));
             runtime.log(`[wristclaw] subscribed to task channel ${p.channel_id} (assigned to me)`);
+          }
+
+          // Auto-process task if assigned to this agent
+          if (p.org_id && (p.assignee_agent_id === botUserId || p.claimed_by_agent === botUserId)) {
+            handleTaskEvent(
+              { task_id: p.task_id, org_id: p.org_id, title: p.title, status: p.status, priority: p.priority, channel_id: p.channel_id, assignee_agent_id: p.assignee_agent_id, claimed_by_agent: p.claimed_by_agent },
+              { account, config, botUserId: botUserId || "", ws },
+            ).catch((err) => runtime.error(`[wristclaw] task processor error: ${String(err)}`));
           }
         }
         return;
