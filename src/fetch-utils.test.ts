@@ -157,8 +157,8 @@ describe("fetchWithRetry", () => {
 });
 
 describe("isTransientError", () => {
-  it("true for AbortError", () => {
-    expect(isTransientError(new DOMException("aborted", "AbortError"))).toBe(true);
+  it("false for AbortError (caller cancel — should not retry)", () => {
+    expect(isTransientError(new DOMException("aborted", "AbortError"))).toBe(false);
   });
 
   it("true for fetch network TypeError", () => {

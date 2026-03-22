@@ -689,9 +689,7 @@ export async function monitorWristClawProvider(
     }
 
     const rawUrl = raw?.media_url;
-    const mediaUrl = rawUrl && rawUrl.startsWith("/")
-      ? `${account.config.baseUrl ?? account.config.serverUrl ?? ""}${rawUrl}`
-      : rawUrl;
+    const mediaUrl = resolveMediaUrl(rawUrl, account.serverUrl);
 
     return mediaGroupBuffer.tryBuffer(key, msg, channelId, wsChannel, mediaUrl, true);
   }

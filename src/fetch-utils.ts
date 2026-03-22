@@ -85,7 +85,12 @@ export async function fetchWithRetry(
 }
 
 export function isTransientError(err: unknown): boolean {
-  if (err instanceof DOMException && err.name === "AbortError") return true;
+  // AbortError from our internal timeout is transient, but AbortError from
+  // a caller's abortSignal is not — the caller wants to cancel, not retry.
+  // We cannot reliably distinguish the two here, so treat AbortError as
+  // non-transient. The timeout controller in fetchWithTimeout already
+  // handles retries at the outer fetchWithRetry loop level.
+  if (err instanceof DOMException && err.name === "AbortError") return false;
   // fetch() throws TypeError for network errors — but so do real bugs.
   // Only retry if the message looks like a network/fetch error.
   if (err instanceof TypeError) {
