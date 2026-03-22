@@ -1015,12 +1015,37 @@ export async function monitorWristClawProvider(
             runtime.log(`[wristclaw] subscribed to task channel ${p.channel_id} (assigned to me)`);
           }
 
-          // Auto-process task if assigned to me
+          // Auto-process: assigned to me directly
           if (p.org_id && isAssignedToMe) {
             handleTaskEvent(
               { task_id: p.task_id, org_id: p.org_id, title: p.title, status: p.status, priority: p.priority, channel_id: p.channel_id, assignee_user_id: p.assignee_id, claimed_by: p.claimed_by },
               { account, config, botUserId: botUserId || "", ws },
             ).catch((err) => runtime.error(`[wristclaw] task processor error: ${String(err)}`));
+          }
+
+          // Auto-process: task became ready (e.g. approval passed) — check if assigned to me via API
+          if (p.org_id && !isAssignedToMe && msg.type === "task:updated" && p.status === "ready") {
+            (async () => {
+              try {
+                const res = await fetchWithRetry(`${account.serverUrl}/v1/orgs/${p.org_id}/tasks/${p.task_id}`, {
+                  headers: authHeaders(account.apiKey), timeoutMs: 10_000, retries: 1,
+                });
+                if (!res.ok) return;
+                const task = await res.json() as { assignee_user_id?: string; channel_id?: string; title?: string; priority?: string };
+                if (task.assignee_user_id === botUserId) {
+                  runtime.log(`[wristclaw] task ${p.task_id} became ready and is assigned to me — auto-processing`);
+                  if (task.channel_id) {
+                    safeSend(JSON.stringify({ type: "subscribe", channel: `${WS_CHANNEL_PREFIX}${task.channel_id}` }));
+                  }
+                  await handleTaskEvent(
+                    { task_id: p.task_id!, org_id: p.org_id!, title: task.title || p.title, status: "ready", priority: task.priority || p.priority, channel_id: task.channel_id || p.channel_id, assignee_user_id: botUserId, claimed_by: undefined },
+                    { account, config, botUserId: botUserId || "", ws },
+                  );
+                }
+              } catch (err) {
+                runtime.error(`[wristclaw] ready-check failed for task ${p.task_id}: ${String(err)}`);
+              }
+            })();
           }
         }
         return;
