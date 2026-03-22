@@ -143,7 +143,6 @@ type TaskInfo = {
   priority: string;
   task_type?: string;
   assignee_user_id?: string;
-  assignee_agent_id?: string;
   channel_id?: string;
   subtask_total?: number;
   subtask_done?: number;
@@ -443,28 +442,25 @@ function makeUpdateTaskTool(cfg: OpenClawConfig): AgentTool {
 // Tool: wristclaw_agent_me
 // ---------------------------------------------------------------------------
 
-function makeAgentMeTool(cfg: OpenClawConfig): AgentTool {
+function makeWhoAmITool(cfg: OpenClawConfig): AgentTool {
   return {
-    name: "wristclaw_agent_me",
-    label: "Agent Identity",
-    description: "Get this agent's own profile — ID, name, role, capabilities, and status.",
+    name: "wristclaw_whoami",
+    label: "Who Am I",
+    description: "Get my own user profile — ID, display name, email, and locale.",
     parameters: {
       type: "object",
       properties: {
-        orgId: { type: "string", description: "Organization ID" },
         accountId: { type: "string" },
       },
-      required: ["orgId"],
     },
     execute: async (_callId, params) => {
       const account = resolveWristClawAccount({ cfg, accountId: params.accountId as string | undefined });
-      const agent = (await fetchJson(`${account.serverUrl}/v1/orgs/${params.orgId}/agents/me`, account.apiKey)) as {
-        id: string; name: string; role: string; capabilities?: string[]; status: string; config?: Record<string, unknown>;
+      const me = (await fetchJson(`${account.serverUrl}/v1/me`, account.apiKey)) as {
+        id: string; display_name?: string; email: string; avatar_url?: string; locale?: string;
       };
-      const caps = agent.capabilities?.length ? agent.capabilities.join(", ") : "none";
       return {
-        content: [{ type: "text", text: `Agent: ${agent.name}\nID: ${agent.id}\nRole: ${agent.role}\nCapabilities: ${caps}\nStatus: ${agent.status}` }],
-        details: agent,
+        content: [{ type: "text", text: `User: ${me.display_name || me.email}\nID: ${me.id}\nEmail: ${me.email}` }],
+        details: me,
       };
     },
   };
@@ -585,7 +581,7 @@ function makeUpdateCaseTool(cfg: OpenClawConfig): AgentTool {
 export function createAgentTools(cfg: OpenClawConfig): AgentTool[] {
   return [
     makeContactsTool(cfg),
-    makeAgentMeTool(cfg),
+    makeWhoAmITool(cfg),
     makeSendMessageTool(cfg),
     makeListOrgsTool(cfg),
     makeListTasksTool(cfg),

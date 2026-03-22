@@ -24,8 +24,8 @@ type TaskEvent = {
   status?: string;
   priority?: string;
   channel_id?: string;
-  assignee_agent_id?: string;
-  claimed_by_agent?: string;
+  assignee_user_id?: string;
+  claimed_by?: string;
 };
 
 type TaskDetails = {
@@ -65,10 +65,10 @@ export async function handleTaskEvent(
   const log = getRuntimeEnv();
   const { account, config, botUserId } = deps;
 
-  // Only process if assigned to this agent
+  // Only process if assigned to this user (agent operates as user)
   const isAssignedToMe =
-    event.assignee_agent_id === botUserId ||
-    event.claimed_by_agent === botUserId;
+    event.assignee_user_id === botUserId ||
+    event.claimed_by === botUserId;
   if (!isAssignedToMe) return;
 
   // Dedup — key includes status so re-assignments (e.g. reopened task) are processed

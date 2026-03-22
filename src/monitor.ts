@@ -112,8 +112,8 @@ type WSTaskEventPayload = {
   status?: string;
   priority?: string;
   channel_id?: string;
-  assignee_agent_id?: string;
-  claimed_by_agent?: string;
+  assignee_id?: string;   // assignee_user_id (agents are users)
+  claimed_by?: string;    // user who claimed
 };
 
 // ---------------------------------------------------------------------------
@@ -1003,16 +1003,18 @@ export async function monitorWristClawProvider(
         if (p?.task_id) {
           runtime.log(`[wristclaw] ${msg.type}: "${p.title || p.task_id}" (status: ${p.status || "?"}, org: ${p.org_id || "?"})`);
 
-          // Subscribe to task channel if assigned to this agent
-          if (p.channel_id && (p.assignee_agent_id === botUserId || p.claimed_by_agent === botUserId)) {
+          const isAssignedToMe = p.assignee_id === botUserId || p.claimed_by === botUserId
+
+          // Subscribe to task channel if assigned to me
+          if (p.channel_id && isAssignedToMe) {
             safeSend(JSON.stringify({ type: "subscribe", channel: `${WS_CHANNEL_PREFIX}${p.channel_id}` }));
             runtime.log(`[wristclaw] subscribed to task channel ${p.channel_id} (assigned to me)`);
           }
 
-          // Auto-process task if assigned to this agent
-          if (p.org_id && (p.assignee_agent_id === botUserId || p.claimed_by_agent === botUserId)) {
+          // Auto-process task if assigned to me
+          if (p.org_id && isAssignedToMe) {
             handleTaskEvent(
-              { task_id: p.task_id, org_id: p.org_id, title: p.title, status: p.status, priority: p.priority, channel_id: p.channel_id, assignee_agent_id: p.assignee_agent_id, claimed_by_agent: p.claimed_by_agent },
+              { task_id: p.task_id, org_id: p.org_id, title: p.title, status: p.status, priority: p.priority, channel_id: p.channel_id, assignee_user_id: p.assignee_id, claimed_by: p.claimed_by },
               { account, config, botUserId: botUserId || "", ws },
             ).catch((err) => runtime.error(`[wristclaw] task processor error: ${String(err)}`));
           }
