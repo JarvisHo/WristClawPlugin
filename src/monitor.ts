@@ -99,7 +99,21 @@ type WSEvent =
   | { type: "pair:created"; channel?: string; payload?: WSPairCreatedPayload }
   | { type: "group:member_added"; channel?: string; payload?: WSGroupMemberAddedPayload }
   | { type: "group:member_changed"; channel?: string; payload?: unknown }
+  | { type: "task:created"; channel?: string; payload?: WSTaskEventPayload }
+  | { type: "task:updated"; channel?: string; payload?: WSTaskEventPayload }
+  | { type: "task:claimed"; channel?: string; payload?: WSTaskEventPayload }
   | { type: "error"; payload?: { message?: string } };
+
+type WSTaskEventPayload = {
+  task_id?: string;
+  org_id?: string;
+  title?: string;
+  status?: string;
+  priority?: string;
+  channel_id?: string;
+  assignee_agent_id?: string;
+  claimed_by_agent?: string;
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -838,6 +852,26 @@ export async function monitorWristClawProvider(
               runtime.log(`[wristclaw] catch-up: dispatched ${catchUpTotal} missed messages`);
             }
           }
+
+          // Subscribe to org channels for task events
+          try {
+            const orgRes = await fetchWithRetry(`${account.serverUrl}/v1/orgs`, {
+              headers: authHeaders(account.apiKey),
+              timeoutMs: 10_000,
+              retries: 1,
+            });
+            if (orgRes.ok) {
+              const orgData = await orgRes.json() as { orgs?: Array<{ id: string; name: string; is_personal: boolean }> };
+              for (const org of orgData.orgs ?? []) {
+                safeSend(JSON.stringify({ type: "subscribe", channel: `org:${org.id}` }));
+              }
+              const orgCount = orgData.orgs?.length ?? 0;
+              if (orgCount > 0) runtime.log(`[wristclaw] subscribed to ${orgCount} org channels for task events`);
+            }
+          } catch (err) {
+            runtime.error(`[wristclaw] org subscription failed: ${String(err)}`);
+          }
+
           isFirstConnect = false;
         } catch (err) {
           runtime.error(`[wristclaw] pair list failed: ${String(err)}`);
@@ -934,6 +968,21 @@ export async function monitorWristClawProvider(
             }
           } catch (err) {
             runtime.error(`[wristclaw] pair refresh failed: ${String(err)}`);
+          }
+        }
+        return;
+      }
+
+      // ── Task events → log for agent awareness ──
+      if (msg.type === "task:created" || msg.type === "task:updated" || msg.type === "task:claimed") {
+        const p = msg.payload;
+        if (p?.task_id) {
+          runtime.log(`[wristclaw] ${msg.type}: "${p.title || p.task_id}" (status: ${p.status || "?"}, org: ${p.org_id || "?"})`);
+
+          // If task was assigned to this agent, subscribe to its channel for messages
+          if (p.channel_id && (p.assignee_agent_id === botUserId || p.claimed_by_agent === botUserId)) {
+            safeSend(JSON.stringify({ type: "subscribe", channel: `${WS_CHANNEL_PREFIX}${p.channel_id}` }));
+            runtime.log(`[wristclaw] subscribed to task channel ${p.channel_id} (assigned to me)`);
           }
         }
         return;
