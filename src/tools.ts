@@ -440,12 +440,153 @@ function makeUpdateTaskTool(cfg: OpenClawConfig): AgentTool {
 }
 
 // ---------------------------------------------------------------------------
+// Tool: wristclaw_agent_me
+// ---------------------------------------------------------------------------
+
+function makeAgentMeTool(cfg: OpenClawConfig): AgentTool {
+  return {
+    name: "wristclaw_agent_me",
+    label: "Agent Identity",
+    description: "Get this agent's own profile — ID, name, role, capabilities, and status.",
+    parameters: {
+      type: "object",
+      properties: {
+        orgId: { type: "string", description: "Organization ID" },
+        accountId: { type: "string" },
+      },
+      required: ["orgId"],
+    },
+    execute: async (_callId, params) => {
+      const account = resolveWristClawAccount({ cfg, accountId: params.accountId as string | undefined });
+      const agent = (await fetchJson(`${account.serverUrl}/v1/orgs/${params.orgId}/agents/me`, account.apiKey)) as {
+        id: string; name: string; role: string; capabilities?: string[]; status: string; config?: Record<string, unknown>;
+      };
+      const caps = agent.capabilities?.length ? agent.capabilities.join(", ") : "none";
+      return {
+        content: [{ type: "text", text: `Agent: ${agent.name}\nID: ${agent.id}\nRole: ${agent.role}\nCapabilities: ${caps}\nStatus: ${agent.status}` }],
+        details: agent,
+      };
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Tool: wristclaw_send_message
+// ---------------------------------------------------------------------------
+
+function makeSendMessageTool(cfg: OpenClawConfig): AgentTool {
+  return {
+    name: "wristclaw_send_message",
+    label: "Send Message",
+    description: "Send a message to a specific WristClaw channel (task channel, DM, group, etc.).",
+    parameters: {
+      type: "object",
+      properties: {
+        channelId: { type: "string", description: "Channel ID to send to" },
+        text: { type: "string", description: "Message text" },
+        reply_to: { type: "string", description: "Optional message ID to reply to" },
+        accountId: { type: "string" },
+      },
+      required: ["channelId", "text"],
+    },
+    execute: async (_callId, params) => {
+      const account = resolveWristClawAccount({ cfg, accountId: params.accountId as string | undefined });
+      const body: Record<string, unknown> = {
+        client_request_id: `agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        content_type: "text",
+        text: params.text,
+        via: "openclaw",
+      };
+      if (params.reply_to) body.reply_to_message_id = params.reply_to;
+      const msg = (await fetchJson(`${account.serverUrl}/v1/channels/${params.channelId}/messages`, account.apiKey, {
+        method: "POST",
+        body: JSON.stringify(body),
+      })) as { message_id: string; channel_id: string };
+      return {
+        content: [{ type: "text", text: `Message sent (id: ${msg.message_id})` }],
+        details: msg,
+      };
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Tool: wristclaw_list_cases
+// ---------------------------------------------------------------------------
+
+function makeListCasesTool(cfg: OpenClawConfig): AgentTool {
+  return {
+    name: "wristclaw_list_cases",
+    label: "List Inbox Cases",
+    description: "List customer service inbox cases. Filter by status (open, pending, resolved, closed).",
+    parameters: {
+      type: "object",
+      properties: {
+        orgId: { type: "string", description: "Organization ID" },
+        status: { type: "string", description: "Filter: open, pending, resolved, closed" },
+        accountId: { type: "string" },
+      },
+      required: ["orgId"],
+    },
+    execute: async (_callId, params) => {
+      const account = resolveWristClawAccount({ cfg, accountId: params.accountId as string | undefined });
+      const qs = new URLSearchParams();
+      if (params.status) qs.set("status", String(params.status));
+      qs.set("limit", "50");
+      const data = (await fetchJson(`${account.serverUrl}/v1/orgs/${params.orgId}/inbox?${qs}`, account.apiKey)) as {
+        cases: Array<{ id: string; customer_id: string; status: string; priority: string; source: string; channel_id?: string; created_at: string }>;
+        total: number;
+      };
+      const cases = data.cases ?? [];
+      const lines = cases.map((c) => `- [${c.status}] ${c.source} customer:${c.customer_id.slice(0, 8)} (id: ${c.id}, channel: ${c.channel_id || "none"})`);
+      return { content: [{ type: "text", text: `${cases.length} cases:\n${lines.join("\n") || "(none)"}` }], details: { total: data.total } };
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Tool: wristclaw_update_case
+// ---------------------------------------------------------------------------
+
+function makeUpdateCaseTool(cfg: OpenClawConfig): AgentTool {
+  return {
+    name: "wristclaw_update_case",
+    label: "Update Inbox Case",
+    description: "Update an inbox case's status or priority.",
+    parameters: {
+      type: "object",
+      properties: {
+        orgId: { type: "string" },
+        caseId: { type: "string", description: "Inbox case ID" },
+        status: { type: "string", description: "open, pending, resolved, closed" },
+        priority: { type: "string", description: "low, normal, high, urgent" },
+        accountId: { type: "string" },
+      },
+      required: ["orgId", "caseId"],
+    },
+    execute: async (_callId, params) => {
+      const account = resolveWristClawAccount({ cfg, accountId: params.accountId as string | undefined });
+      const body: Record<string, unknown> = {};
+      if (params.status) body.status = params.status;
+      if (params.priority) body.priority = params.priority;
+      const updated = (await fetchJson(`${account.serverUrl}/v1/orgs/${params.orgId}/inbox/${params.caseId}`, account.apiKey, {
+        method: "PATCH",
+        body: JSON.stringify(body),
+      })) as { id: string; status: string; priority: string };
+      return { content: [{ type: "text", text: `Case updated: ${updated.id} → status: ${updated.status}` }], details: updated };
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Export
 // ---------------------------------------------------------------------------
 
 export function createAgentTools(cfg: OpenClawConfig): AgentTool[] {
   return [
     makeContactsTool(cfg),
+    makeAgentMeTool(cfg),
+    makeSendMessageTool(cfg),
     makeListOrgsTool(cfg),
     makeListTasksTool(cfg),
     makeGetTaskTool(cfg),
@@ -455,5 +596,7 @@ export function createAgentTools(cfg: OpenClawConfig): AgentTool[] {
     makeSubmitTaskTool(cfg),
     makeListQueueTool(cfg),
     makeUpdateTaskTool(cfg),
+    makeListCasesTool(cfg),
+    makeUpdateCaseTool(cfg),
   ];
 }
