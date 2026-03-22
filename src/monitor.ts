@@ -852,7 +852,7 @@ export async function monitorWristClawProvider(
             }
           }
 
-          // Subscribe to org channels for task events
+          // Subscribe to org channels for task events + org DM/team channels
           try {
             const orgRes = await fetchWithRetry(`${account.serverUrl}/v1/orgs`, {
               headers: authHeaders(account.apiKey),
@@ -861,11 +861,36 @@ export async function monitorWristClawProvider(
             });
             if (orgRes.ok) {
               const orgData = await orgRes.json() as { orgs?: Array<{ id: string; name: string; is_personal: boolean }> };
-              for (const org of orgData.orgs ?? []) {
+              const orgs = orgData.orgs ?? [];
+              for (const org of orgs) {
                 safeSend(JSON.stringify({ type: "subscribe", channel: `org:${org.id}` }));
               }
-              const orgCount = orgData.orgs?.length ?? 0;
-              if (orgCount > 0) runtime.log(`[wristclaw] subscribed to ${orgCount} org channels for task events`);
+              if (orgs.length > 0) runtime.log(`[wristclaw] subscribed to ${orgs.length} org channels for task events`);
+
+              // Fetch and subscribe to org DM + team channels
+              let orgChannelCount = 0;
+              for (const org of orgs) {
+                try {
+                  const chRes = await fetchWithRetry(
+                    `${account.serverUrl}/v1/orgs/${org.id}/channels?purpose=team,org_dm&limit=100`,
+                    { headers: authHeaders(account.apiKey), timeoutMs: 10_000, retries: 1 },
+                  );
+                  if (chRes.ok) {
+                    const chData = await chRes.json() as { channels?: Array<{ id: string; channel_purpose: string }> };
+                    for (const ch of chData.channels ?? []) {
+                      const chKey = `${WS_CHANNEL_PREFIX}${ch.id}`;
+                      if (!subscribedChannels.has(ch.id)) {
+                        subscribedChannels.add(ch.id);
+                        safeSend(JSON.stringify({ type: "subscribe", channel: chKey }));
+                        orgChannelCount++;
+                      }
+                    }
+                  }
+                } catch {
+                  // best-effort per org
+                }
+              }
+              if (orgChannelCount > 0) runtime.log(`[wristclaw] subscribed to ${orgChannelCount} org DM/team channels`);
             }
           } catch (err) {
             runtime.error(`[wristclaw] org subscription failed: ${String(err)}`);
