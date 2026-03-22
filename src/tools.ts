@@ -575,6 +575,171 @@ function makeUpdateCaseTool(cfg: OpenClawConfig): AgentTool {
 }
 
 // ---------------------------------------------------------------------------
+// Tool: wristclaw_list_subtasks
+// ---------------------------------------------------------------------------
+
+function makeListSubtasksTool(cfg: OpenClawConfig): AgentTool {
+  return {
+    name: "wristclaw_list_subtasks",
+    label: "List Subtasks",
+    description: "List subtask checklist items for a task.",
+    parameters: {
+      type: "object",
+      properties: { orgId: { type: "string" }, taskId: { type: "string" }, accountId: { type: "string" } },
+      required: ["orgId", "taskId"],
+    },
+    execute: async (_callId, params) => {
+      const account = resolveWristClawAccount({ cfg, accountId: params.accountId as string | undefined });
+      const data = (await fetchJson(`${account.serverUrl}/v1/orgs/${params.orgId}/tasks/${params.taskId}/subtasks`, account.apiKey)) as {
+        subtasks: Array<{ id: string; title: string; completed: boolean; sort_order: number }>;
+      };
+      const items = data.subtasks ?? [];
+      const lines = items.map(s => `${s.completed ? "✅" : "⬜"} ${s.title} (id: ${s.id})`);
+      return { content: [{ type: "text", text: items.length > 0 ? lines.join("\n") : "(no subtasks)" }], details: { subtasks: items } };
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Tool: wristclaw_create_subtask
+// ---------------------------------------------------------------------------
+
+function makeCreateSubtaskTool(cfg: OpenClawConfig): AgentTool {
+  return {
+    name: "wristclaw_create_subtask",
+    label: "Create Subtask",
+    description: "Add a subtask checklist item to a task.",
+    parameters: {
+      type: "object",
+      properties: {
+        orgId: { type: "string" },
+        taskId: { type: "string" },
+        title: { type: "string", description: "Subtask title" },
+        accountId: { type: "string" },
+      },
+      required: ["orgId", "taskId", "title"],
+    },
+    execute: async (_callId, params) => {
+      const account = resolveWristClawAccount({ cfg, accountId: params.accountId as string | undefined });
+      const sub = (await fetchJson(`${account.serverUrl}/v1/orgs/${params.orgId}/tasks/${params.taskId}/subtasks`, account.apiKey, {
+        method: "POST",
+        body: JSON.stringify({ title: params.title }),
+      })) as { id: string; title: string };
+      return { content: [{ type: "text", text: `Subtask created: "${sub.title}" (id: ${sub.id})` }], details: sub };
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Tool: wristclaw_toggle_subtask
+// ---------------------------------------------------------------------------
+
+function makeToggleSubtaskTool(cfg: OpenClawConfig): AgentTool {
+  return {
+    name: "wristclaw_toggle_subtask",
+    label: "Toggle Subtask",
+    description: "Mark a subtask as completed or uncompleted.",
+    parameters: {
+      type: "object",
+      properties: {
+        orgId: { type: "string" },
+        taskId: { type: "string" },
+        subtaskId: { type: "string" },
+        completed: { type: "boolean", description: "true to complete, false to uncomplete" },
+        accountId: { type: "string" },
+      },
+      required: ["orgId", "taskId", "subtaskId", "completed"],
+    },
+    execute: async (_callId, params) => {
+      const account = resolveWristClawAccount({ cfg, accountId: params.accountId as string | undefined });
+      const sub = (await fetchJson(`${account.serverUrl}/v1/orgs/${params.orgId}/tasks/${params.taskId}/subtasks/${params.subtaskId}`, account.apiKey, {
+        method: "PATCH",
+        body: JSON.stringify({ completed: params.completed }),
+      })) as { id: string; title: string; completed: boolean };
+      return { content: [{ type: "text", text: `Subtask "${sub.title}" → ${sub.completed ? "✅ completed" : "⬜ uncompleted"}` }], details: sub };
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Tool: wristclaw_list_child_tasks
+// ---------------------------------------------------------------------------
+
+function makeListChildTasksTool(cfg: OpenClawConfig): AgentTool {
+  return {
+    name: "wristclaw_list_child_tasks",
+    label: "List Child Tasks",
+    description: "List child tasks spawned from a parent task.",
+    parameters: {
+      type: "object",
+      properties: { orgId: { type: "string" }, taskId: { type: "string" }, accountId: { type: "string" } },
+      required: ["orgId", "taskId"],
+    },
+    execute: async (_callId, params) => {
+      const account = resolveWristClawAccount({ cfg, accountId: params.accountId as string | undefined });
+      const data = (await fetchJson(`${account.serverUrl}/v1/orgs/${params.orgId}/tasks/${params.taskId}/children`, account.apiKey)) as {
+        tasks: TaskInfo[];
+      };
+      const tasks = data.tasks ?? [];
+      const lines = tasks.map(t => `- [${t.status}] ${t.title} (id: ${t.id})`);
+      return { content: [{ type: "text", text: tasks.length > 0 ? lines.join("\n") : "(no child tasks)" }], details: { tasks } };
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Tool: wristclaw_manage_dependencies
+// ---------------------------------------------------------------------------
+
+function makeListDependenciesTool(cfg: OpenClawConfig): AgentTool {
+  return {
+    name: "wristclaw_list_dependencies",
+    label: "List Dependencies",
+    description: "List task dependencies (tasks that must be done before this task can start).",
+    parameters: {
+      type: "object",
+      properties: { orgId: { type: "string" }, taskId: { type: "string" }, accountId: { type: "string" } },
+      required: ["orgId", "taskId"],
+    },
+    execute: async (_callId, params) => {
+      const account = resolveWristClawAccount({ cfg, accountId: params.accountId as string | undefined });
+      const data = (await fetchJson(`${account.serverUrl}/v1/orgs/${params.orgId}/tasks/${params.taskId}/dependencies`, account.apiKey)) as {
+        dependencies: Array<{ id: string; depends_on_id: string; depends_on_title?: string; depends_on_status?: string }>;
+      };
+      const deps = data.dependencies ?? [];
+      const lines = deps.map(d => `- [${d.depends_on_status || "?"}] ${d.depends_on_title || d.depends_on_id}`);
+      return { content: [{ type: "text", text: deps.length > 0 ? `Blocked by:\n${lines.join("\n")}` : "(no dependencies)" }], details: { dependencies: deps } };
+    },
+  };
+}
+
+function makeAddDependencyTool(cfg: OpenClawConfig): AgentTool {
+  return {
+    name: "wristclaw_add_dependency",
+    label: "Add Dependency",
+    description: "Add a dependency — this task cannot start until the dependency task is done.",
+    parameters: {
+      type: "object",
+      properties: {
+        orgId: { type: "string" },
+        taskId: { type: "string", description: "Task that depends on another" },
+        dependsOnId: { type: "string", description: "Task that must be done first" },
+        accountId: { type: "string" },
+      },
+      required: ["orgId", "taskId", "dependsOnId"],
+    },
+    execute: async (_callId, params) => {
+      const account = resolveWristClawAccount({ cfg, accountId: params.accountId as string | undefined });
+      await fetchJson(`${account.serverUrl}/v1/orgs/${params.orgId}/tasks/${params.taskId}/dependencies`, account.apiKey, {
+        method: "POST",
+        body: JSON.stringify({ depends_on_id: params.dependsOnId }),
+      });
+      return { content: [{ type: "text", text: `Dependency added: ${params.taskId} depends on ${params.dependsOnId}` }], details: {} };
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Export
 // ---------------------------------------------------------------------------
 
@@ -592,6 +757,12 @@ export function createAgentTools(cfg: OpenClawConfig): AgentTool[] {
     makeSubmitTaskTool(cfg),
     makeListQueueTool(cfg),
     makeUpdateTaskTool(cfg),
+    makeListSubtasksTool(cfg),
+    makeCreateSubtaskTool(cfg),
+    makeToggleSubtaskTool(cfg),
+    makeListChildTasksTool(cfg),
+    makeListDependenciesTool(cfg),
+    makeAddDependencyTool(cfg),
     makeListCasesTool(cfg),
     makeUpdateCaseTool(cfg),
   ];
