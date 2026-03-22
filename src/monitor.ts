@@ -884,6 +884,10 @@ export async function monitorWristClawProvider(
                         safeSend(JSON.stringify({ type: "subscribe", channel: chKey }));
                         orgChannelCount++;
                       }
+                      // Track team channels as group for @mention policy
+                      if (ch.channel_purpose === "team") {
+                        groupChannelIds.add(ch.id);
+                      }
                     }
                   }
                 } catch {
