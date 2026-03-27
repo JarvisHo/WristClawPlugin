@@ -166,28 +166,34 @@ export class SenderRateLimiter {
 // API message → WS event conversion (catch-up)
 // ---------------------------------------------------------------------------
 
+/** Flat API response from GET /v1/channels/{id}/messages (ChatMessageResponse). */
 type APIMessage = {
   message_id: string;
   author_id: string;
   channel_id: string;
-  payload?: { content_type?: string; text?: string; media_url?: string; duration_sec?: number; via?: string };
+  content_type?: string;
+  text?: string;
   media_url?: string;
+  duration_sec?: number;
+  via?: string;
+  metadata?: unknown;
   created_at: string;
   reply_context?: { message_id?: string; author_id?: string; text_preview?: string };
 };
 
 export function apiMessageToWSPayload(msg: APIMessage) {
-  // Flat structure (matches WSMessagePayload flat fields)
+  // Server returns flat ChatMessageResponse — map directly to WSMessagePayload
   return {
     message_id: msg.message_id,
     channel_id: msg.channel_id,
     author_id: msg.author_id,
-    media_url: msg.payload?.media_url ?? msg.media_url,
+    media_url: msg.media_url,
     created_at: msg.created_at,
-    content_type: msg.payload?.content_type,
-    text: msg.payload?.text,
-    duration_sec: msg.payload?.duration_sec,
-    via: msg.payload?.via,
+    content_type: msg.content_type,
+    text: msg.text,
+    duration_sec: msg.duration_sec,
+    via: msg.via,
+    metadata: msg.metadata,
     reply_to: msg.reply_context ? {
       message_id: msg.reply_context.message_id,
       author_id: msg.reply_context.author_id,

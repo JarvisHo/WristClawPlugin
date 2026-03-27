@@ -57,16 +57,21 @@ type WSMessagePayload = {
   pair_id?: string;
   author_id?: string;
   sender_name?: string;
+  sender_kind?: string;
   channel_id?: string;
   message_id?: string;
   created_at?: string;
   media_url?: string;
+  thumbnail_url?: string;
   reply_to?: WSReplyTo;
   client_request_id?: string;
   content_type?: string;
   text?: string;
   via?: string;
   duration_sec?: number;
+  file_name?: string;
+  file_size_bytes?: number;
+  metadata?: unknown;
 };
 
 /** voice:transcribed payload (legacy, kept for WSEvent union compat) */
@@ -91,18 +96,18 @@ type WSGroupMemberAddedPayload = {
 };
 
 type WSEvent =
-  | { type: "authenticated" }
+  | { type: "authenticated"; seq?: number }
   | { type: "pong" }
   | { type: "subscribed"; channel?: string }
-  | { type: "message:new"; channel?: string; payload?: WSMessagePayload }
-  | { type: "voice:transcribed"; channel?: string; payload?: WSVoiceTranscribedPayload }
-  | { type: "message:update"; channel?: string; payload?: { message_id?: string; channel_id?: string; author_id?: string; text?: string; language?: string } }
-  | { type: "pair:created"; channel?: string; payload?: WSPairCreatedPayload }
-  | { type: "group:member_added"; channel?: string; payload?: WSGroupMemberAddedPayload }
-  | { type: "group:member_changed"; channel?: string; payload?: unknown }
-  | { type: "task:created"; channel?: string; payload?: WSTaskEventPayload }
-  | { type: "task:updated"; channel?: string; payload?: WSTaskEventPayload }
-  | { type: "task:claimed"; channel?: string; payload?: WSTaskEventPayload }
+  | { type: "message:new"; seq?: number; channel?: string; payload?: WSMessagePayload }
+  | { type: "voice:transcribed"; seq?: number; channel?: string; payload?: WSVoiceTranscribedPayload }
+  | { type: "message:update"; seq?: number; channel?: string; payload?: { message_id?: string; channel_id?: string; author_id?: string; text?: string; language?: string } }
+  | { type: "pair:created"; seq?: number; channel?: string; payload?: WSPairCreatedPayload }
+  | { type: "group:member_added"; seq?: number; channel?: string; payload?: WSGroupMemberAddedPayload }
+  | { type: "group:member_changed"; seq?: number; channel?: string; payload?: unknown }
+  | { type: "task:created"; seq?: number; channel?: string; payload?: WSTaskEventPayload }
+  | { type: "task:updated"; seq?: number; channel?: string; payload?: WSTaskEventPayload }
+  | { type: "task:claimed"; seq?: number; channel?: string; payload?: WSTaskEventPayload }
   | { type: "error"; payload?: { message?: string } };
 
 type WSTaskEventPayload = {
@@ -306,6 +311,10 @@ async function processMessage(ctx: ProcessMessageCtx): Promise<void> {
     rawBody = text?.trim() || (imageCount > 1 ? `📷 ${imageCount} 張圖片` : "📷 圖片");
   } else if (contentType === "interactive") {
     rawBody = text?.trim() || "📋 互動訊息";
+  } else if (contentType === "sticker") {
+    rawBody = text?.trim() || "🏷️ 貼圖";
+  } else if (contentType === "location") {
+    rawBody = text?.trim() || "📍 位置";
   } else {
     rawBody = text?.trim() ?? "";
   }

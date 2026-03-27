@@ -205,12 +205,14 @@ describe("SenderRateLimiter", () => {
 // ---------------------------------------------------------------------------
 
 describe("apiMessageToWSPayload", () => {
-  it("converts API message format", () => {
+  it("converts flat API message format", () => {
     const result = apiMessageToWSPayload({
       message_id: "123",
       author_id: "user1",
       channel_id: "ch1",
-      payload: { content_type: "text", text: "hello", via: "app" },
+      content_type: "text",
+      text: "hello",
+      via: "app",
       media_url: "https://cdn/img.jpg",
       created_at: "2026-02-25T10:00:00Z",
     });
@@ -220,7 +222,7 @@ describe("apiMessageToWSPayload", () => {
     expect(result.via).toBe("app");
     expect(result.media_url).toBe("https://cdn/img.jpg");
   });
-  it("handles missing payload fields", () => {
+  it("handles missing optional fields", () => {
     const result = apiMessageToWSPayload({
       message_id: "456",
       author_id: "u",
@@ -255,9 +257,23 @@ describe("apiMessageToWSPayload", () => {
       author_id: "user1",
       channel_id: "ch1",
       created_at: "2026-03-01T00:00:00Z",
-      payload: { content_type: "text", text: "no reply" },
+      content_type: "text",
+      text: "no reply",
     });
     expect(result.reply_to).toBeUndefined();
+  });
+  it("passes through metadata field", () => {
+    const meta = { sticker_id: "abc", package_id: "123" };
+    const result = apiMessageToWSPayload({
+      message_id: "900",
+      author_id: "user1",
+      channel_id: "ch1",
+      created_at: "2026-03-01T00:00:00Z",
+      content_type: "sticker",
+      metadata: meta,
+    });
+    expect(result.content_type).toBe("sticker");
+    expect(result.metadata).toEqual(meta);
   });
 });
 
